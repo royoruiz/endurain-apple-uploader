@@ -11,9 +11,12 @@ struct StatusView: View {
 
     var store: SettingsStore
     var healthKitService: HealthKitService
+    var uploadStore: UploadStore
 
     @State private var showConfirmClear: Bool = false
+    @State private var showConfirmClearHistory: Bool = false
     @State private var clearError: String? = nil
+    @State private var showUploadErrorDetail: Bool = false
 
     // MARK: - Body
 
@@ -23,6 +26,7 @@ struct StatusView: View {
                 serverSection
                 healthKitPermissionsSection
                 lastUploadedSection
+                uploadSection
                 tcxSection
                 latestWorkoutSection
                 dangerZoneSection
@@ -37,6 +41,16 @@ struct StatusView: View {
                 Button("Cancelar", role: .cancel) {}
             } message: {
                 Text("Se eliminará la URL del servidor y la API Key. Tendrás que volver a configurar la app.")
+            }
+            .confirmationDialog(
+                "¿Borrar historial de subidas?",
+                isPresented: $showConfirmClearHistory,
+                titleVisibility: .visible
+            ) {
+                Button("Borrar historial", role: .destructive) { clearUploadHistory() }
+                Button("Cancelar", role: .cancel) {}
+            } message: {
+                Text("Esto olvidará qué entrenamientos se han subido. Podrías volver a subir duplicados. ¿Continuar?")
             }
         }
     }
@@ -62,14 +76,12 @@ struct StatusView: View {
                     .foregroundStyle(permissionColor)
                 Text(permissionLabel)
             }
-
             Button {
                 Task { await healthKitService.requestAuthorization() }
             } label: {
                 Text("Solicitar permisos de Salud")
             }
             .disabled(isPermissionButtonDisabled)
-
         } header: {
             Text("Permisos de Apple Salud")
         } footer: {
@@ -81,8 +93,94 @@ struct StatusView: View {
 
     private var lastUploadedSection: some View {
         Section("Último subido a Endurain") {
-            Text("Ninguno todavía")
-                .foregroundStyle(.secondary)
+            if let last = uploadStore.lastRecord {
+                LabeledContent("Subido") {
+                    Text(last.uploadedAt, format: .dateTime)
+                        .foregroundStyle(.secondary)
+                }
+                LabeledContent("Fichero") {
+                    Text(last.filename)
+                        .foregroundStyle(.secondary)
+                        .font(.caption)
+                }
+                LabeledContent("Servidor") {
+                    Text(last.serverURL)
+                        .foregroundStyle(.secondary)
+                        .font(.caption)
+                }
+            } else {
+                Text("Ninguno todavía")
+                    .foregroundStyle(.secondary)
+            }
+        }
+    }
+
+    // MARK: - Upload section
+
+    private var uploadSection: some View {
+        Section {
+            let alreadyUploaded = isCurrentWorkoutUploaded
+
+            if alreadyUploaded {
+                HStack(spacing: 10) {
+                    Image(systemName: "checkmark.circle.fill")
+                        .foregroundStyle(.green)
+                    Text("Este entrenamiento ya está subido")
+                }
+                if let record = currentUploadRecord {
+                    Text("Subido el \(record.uploadedAt.formatted(.dateTime))")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+            } else {
+                Button {
+                    showUploadErrorDetail = false
+                    Task { await healthKitService.uploadWorkout(uploadStore: uploadStore, settings: store) }
+                } label: {
+                    HStack {
+                        if healthKitService.isUploading {
+                            ProgressView().padding(.trailing, 4)
+                        }
+                        Text(uploadButtonLabel)
+                    }
+                    .frame(maxWidth: .infinity)
+                }
+                .buttonStyle(.borderedProminent)
+                .disabled(uploadButtonDisabled)
+            }
+
+            // Error de subida
+            if let errMsg = healthKitService.uploadErrorMessage {
+                Text(errMsg)
+                    .font(.caption)
+                    .foregroundStyle(.red)
+
+                if let detail = healthKitService.uploadErrorDetail {
+                    DisclosureGroup("Detalle técnico", isExpanded: $showUploadErrorDetail) {
+                        Text(detail)
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                            .textSelection(.enabled)
+                    }
+                    .font(.caption)
+                }
+            }
+
+            // Resultado exitoso
+            if healthKitService.uploadStep == .done {
+                HStack(spacing: 8) {
+                    Image(systemName: "checkmark.circle.fill")
+                        .foregroundStyle(.green)
+                    Text("Entrenamiento subido correctamente")
+                        .foregroundStyle(.green)
+                }
+                .font(.subheadline)
+            }
+
+        } header: {
+            Text("Subir a Endurain")
+        } footer: {
+            Text("Se usa la API key configurada en Ajustes.")
         }
     }
 
@@ -148,7 +246,9 @@ struct StatusView: View {
                 .foregroundStyle(.secondary)
         }
 
-        if detail.hasRoute, let first = detail.routePoints.first, let last = detail.routePoints.last {
+        if detail.hasRoute,
+           let first = detail.routePoints.first,
+           let last = detail.routePoints.last {
             VStack(alignment: .leading, spacing: 2) {
                 Text("Primera coord: \(coordString(first)) @ \(timeString(first.timestamp))")
                 Text("Última coord:  \(coordString(last)) @ \(timeString(last.timestamp))")
@@ -215,23 +315,19 @@ struct StatusView: View {
     @ViewBuilder
     private func workoutDetails(_ w: WorkoutSummary) -> some View {
         LabeledContent("Tipo", value: w.activityTypeName)
-
         LabeledContent("Inicio") {
             Text(w.startDate, format: .dateTime).foregroundStyle(.secondary)
         }
         LabeledContent("Fin") {
             Text(w.endDate, format: .dateTime).foregroundStyle(.secondary)
         }
-
         LabeledContent("Duración", value: formattedDuration(w.durationSeconds))
-
         if let distanceM = w.totalDistanceMeters {
             LabeledContent("Distancia", value: formattedDistance(distanceM))
         }
         if let kcal = w.activeEnergyKcal {
             LabeledContent("Calorías activas", value: String(format: "%.0f kcal", kcal))
         }
-
         Text(w.id.uuidString)
             .font(.caption2)
             .foregroundStyle(.tertiary)
@@ -247,11 +343,55 @@ struct StatusView: View {
                     .font(.caption)
                     .foregroundStyle(.red)
             }
+
+            Button(role: .destructive) {
+                showConfirmClearHistory = true
+            } label: {
+                Text("Borrar historial de subidas")
+                    .frame(maxWidth: .infinity)
+            }
+            .buttonStyle(.bordered)
+
             Button(role: .destructive) {
                 showConfirmClear = true
             } label: {
-                Text("Borrar configuración").frame(maxWidth: .infinity)
+                Text("Borrar configuración")
+                    .frame(maxWidth: .infinity)
             }
+            .buttonStyle(.bordered)
+        } header: {
+            Text("Zona de peligro")
+        } footer: {
+            Text("\"Borrar historial\" solo olvida las subidas locales. No elimina nada en Endurain.")
+        }
+    }
+
+    // MARK: - Upload helpers
+
+    private var isCurrentWorkoutUploaded: Bool {
+        guard let id = healthKitService.latestWorkout?.id else { return false }
+        return uploadStore.isUploaded(workoutUUID: id)
+    }
+
+    private var currentUploadRecord: UploadRecord? {
+        guard let id = healthKitService.latestWorkout?.id else { return nil }
+        return uploadStore.record(for: id)
+    }
+
+    private var uploadButtonDisabled: Bool {
+        healthKitService.latestWorkout == nil
+            || healthKitService.isUploading
+            || healthKitService.isGeneratingTCX
+            || isCurrentWorkoutUploaded
+    }
+
+    private var uploadButtonLabel: String {
+        switch healthKitService.uploadStep {
+        case .generatingTCX: return "Generando TCX..."
+        case .uploading:     return "Subiendo a Endurain..."
+        case .savingState:   return "Guardando estado..."
+        case .done:          return "¡Subido!"
+        case .idle:          return "Subir entrenamiento a Endurain"
         }
     }
 
@@ -269,10 +409,10 @@ struct StatusView: View {
 
     private var permissionLabel: String {
         switch healthKitService.permissionStatus {
-        case .notRequested:    return "Permisos no solicitados"
-        case .available:       return "Solicitud completada / HealthKit disponible"
-        case .unavailable:     return "HealthKit no disponible en este dispositivo"
-        case .error(let msg):  return "Error: \(msg)"
+        case .notRequested:   return "Permisos no solicitados"
+        case .available:      return "Solicitud completada / HealthKit disponible"
+        case .unavailable:    return "HealthKit no disponible en este dispositivo"
+        case .error(let msg): return "Error: \(msg)"
         }
     }
 
@@ -329,11 +469,26 @@ struct StatusView: View {
         do {
             try store.clear()
         } catch {
-            clearError = "Error al borrar: \(error.localizedDescription)"
+            clearError = "Error al borrar configuración: \(error.localizedDescription)"
+        }
+    }
+
+    private func clearUploadHistory() {
+        do {
+            try uploadStore.clear()
+            healthKitService.uploadStep = .idle
+            healthKitService.uploadErrorMessage = nil
+            healthKitService.uploadErrorDetail = nil
+        } catch {
+            clearError = "Error al borrar historial: \(error.localizedDescription)"
         }
     }
 }
 
 #Preview {
-    StatusView(store: SettingsStore(), healthKitService: HealthKitService())
+    StatusView(
+        store: SettingsStore(),
+        healthKitService: HealthKitService(),
+        uploadStore: UploadStore()
+    )
 }

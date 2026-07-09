@@ -14,9 +14,19 @@ import Observation
 
 enum HealthKitPermissionStatus {
     case notRequested
-    case available       // requestAuthorization completó sin error del sistema
-    case unavailable     // HKHealthStore.isHealthDataAvailable() == false
+    case available
+    case unavailable
     case error(String)
+}
+
+// MARK: - Upload step
+
+enum UploadStep: Equatable {
+    case idle
+    case generatingTCX
+    case uploading
+    case savingState
+    case done
 }
 
 // MARK: - HealthKitService
@@ -25,24 +35,29 @@ enum HealthKitPermissionStatus {
 @MainActor
 final class HealthKitService {
 
-    // MARK: - Observable state
+    // MARK: - Observable state — workout
 
-    // Resumen ligero para UI (Fase 2)
     var latestWorkout: WorkoutSummary? = nil
-
-    // Opción B: objeto HK nativo guardado en memoria, solo en memoria
-    var latestHKWorkout: HKWorkout? = nil
-
+    var latestHKWorkout: HKWorkout? = nil       // Opción B: nativo, solo en memoria
     var permissionStatus: HealthKitPermissionStatus = .notRequested
     var isLoading: Bool = false
     var errorMessage: String? = nil
 
-    // Estado TCX (Fase 3)
+    // MARK: - Observable state — TCX
+
     var latestWorkoutDetail: WorkoutDetail? = nil
     var tcxString: String? = nil
     var tcxFileURL: URL? = nil
     var isGeneratingTCX: Bool = false
     var tcxErrorMessage: String? = nil
+
+    // MARK: - Observable state — upload
+
+    var isUploading: Bool = false
+    var uploadStep: UploadStep = .idle
+    var uploadErrorMessage: String? = nil
+    var uploadErrorDetail: String? = nil    // body técnico para DisclosureGroup
+    var lastUploadedAt: Date? = nil
 
     // MARK: - Private
 
@@ -59,7 +74,7 @@ final class HealthKitService {
         ]
     }
 
-    // MARK: - Request Authorization
+    // MARK: - Authorization
 
     func requestAuthorization() async {
         guard HKHealthStore.isHealthDataAvailable() else {
@@ -85,15 +100,18 @@ final class HealthKitService {
         isLoading = true
         errorMessage = nil
 
-        // Resetear estado TCX al buscar un workout nuevo
+        // Resetear estado TCX y subida al buscar un workout nuevo
         tcxString = nil
         tcxFileURL = nil
         latestWorkoutDetail = nil
         tcxErrorMessage = nil
+        uploadStep = .idle
+        uploadErrorMessage = nil
+        uploadErrorDetail = nil
 
         do {
             if let workout = try await queryLatestHKWorkout() {
-                latestHKWorkout = workout   // Opción B: guardar nativo
+                latestHKWorkout = workout
                 latestWorkout = WorkoutSummary(
                     id: workout.uuid,
                     activityTypeName: workout.workoutActivityType.displayName,
@@ -114,7 +132,7 @@ final class HealthKitService {
         isLoading = false
     }
 
-    // MARK: - Generate TCX
+    // MARK: - Generate TCX (standalone, para inspección)
 
     func generateTCX() async {
         guard let workout = latestHKWorkout else {
@@ -129,12 +147,94 @@ final class HealthKitService {
         do {
             let detail = try await buildWorkoutDetail(for: workout)
             latestWorkoutDetail = detail
-
             let tcx = TCXGenerator.generate(from: detail)
             tcxString = tcx
             tcxFileURL = try writeTCXToTemp(tcx, uuid: detail.id)
         } catch {
             tcxErrorMessage = error.localizedDescription
+        }
+    }
+
+    // MARK: - Upload workout
+
+    /// Orquesta: genera TCX → sube a Endurain → guarda en UploadStore.
+    /// Siempre regenera el TCX para garantizar consistencia con latestHKWorkout.
+    func uploadWorkout(uploadStore: UploadStore, settings: SettingsStore) async {
+        guard let workout = latestHKWorkout else {
+            uploadErrorMessage = "Primero busca un entrenamiento."
+            return
+        }
+
+        guard !uploadStore.isUploaded(workoutUUID: workout.uuid) else {
+            uploadErrorMessage = "Este entrenamiento ya está subido a Endurain."
+            return
+        }
+
+        let resolvedAPIKey: String
+        do {
+            guard let k = try settings.readAPIKey(), !k.isEmpty else {
+                uploadErrorMessage = "No se encontró la API key. Revisa la configuración."
+                return
+            }
+            resolvedAPIKey = k
+        } catch {
+            uploadErrorMessage = "Error al leer la API key: \(error.localizedDescription)"
+            return
+        }
+
+        isUploading = true
+        uploadStep = .generatingTCX
+        uploadErrorMessage = nil
+        uploadErrorDetail = nil
+        defer { isUploading = false }
+
+        do {
+            // 1. Generar TCX (siempre desde cero)
+            let detail = try await buildWorkoutDetail(for: workout)
+            let tcxString = TCXGenerator.generate(from: detail)
+            guard let tcxData = tcxString.data(using: .utf8) else {
+                uploadErrorMessage = "Error al codificar el TCX."
+                uploadStep = .idle
+                return
+            }
+
+            // Actualizar estado TCX en la UI también
+            latestWorkoutDetail = detail
+            self.tcxString = tcxString
+            self.tcxFileURL = try? writeTCXToTemp(tcxString, uuid: detail.id)
+
+            let filename = "apple-health-\(workout.uuid.uuidString.lowercased()).tcx"
+
+            // 2. Subir a Endurain
+            uploadStep = .uploading
+            let client = EndurainClient(serverURL: settings.serverURL, apiKey: resolvedAPIKey)
+            _ = try await client.uploadActivityTCX(tcxData: tcxData, filename: filename)
+
+            // 3. Guardar en UploadStore
+            uploadStep = .savingState
+            let record = UploadRecord(
+                id: workout.uuid,
+                startDate: workout.startDate,
+                endDate: workout.endDate,
+                uploadedAt: Date(),
+                filename: filename,
+                serverURL: settings.serverURL
+            )
+            try uploadStore.save(record: record)
+            lastUploadedAt = record.uploadedAt
+
+            uploadStep = .done
+
+        } catch let error as EndurainClientError {
+            uploadErrorMessage = error.errorDescription ?? error.localizedDescription
+            // Extraer detalle técnico si es uploadError
+            if case .uploadError(let code, let body) = error {
+                uploadErrorDetail = "HTTP \(code)\n\(body)"
+            }
+            uploadStep = .idle
+        } catch {
+            uploadErrorMessage = error.localizedDescription
+            uploadStep = .idle
         }
     }
 
@@ -173,7 +273,6 @@ final class HealthKitService {
     // MARK: - Fetch Routes
 
     func fetchRoutes(for workout: HKWorkout) async throws -> [CLLocation] {
-        // Paso 1: obtener objetos HKWorkoutRoute asociados al workout
         let routes: [HKWorkoutRoute] = try await withCheckedThrowingContinuation { continuation in
             let predicate = HKQuery.predicateForObjects(from: workout)
             let query = HKSampleQuery(
@@ -193,14 +292,11 @@ final class HealthKitService {
 
         guard !routes.isEmpty else { return [] }
 
-        // Paso 2: para cada ruta, acumular CLLocation con HKWorkoutRouteQuery
         var allLocations: [CLLocation] = []
         for route in routes {
             let locations = try await fetchLocations(for: route)
             allLocations.append(contentsOf: locations)
         }
-
-        // Ordenar por timestamp
         allLocations.sort { $0.timestamp < $1.timestamp }
         return allLocations
     }

@@ -12,10 +12,15 @@ struct EndurainAppleUploaderApp: App {
 
     @State private var settingsStore = SettingsStore()
     @State private var healthKitService = HealthKitService()
+    @State private var uploadStore = UploadStore()
 
     var body: some Scene {
         WindowGroup {
-            ContentView(store: settingsStore, healthKitService: healthKitService)
+            ContentView(
+                store: settingsStore,
+                healthKitService: healthKitService,
+                uploadStore: uploadStore
+            )
         }
     }
 }
