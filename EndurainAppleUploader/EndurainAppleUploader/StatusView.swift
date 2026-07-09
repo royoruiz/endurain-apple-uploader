@@ -17,6 +17,7 @@ struct StatusView: View {
     @State private var showConfirmClearHistory = false
     @State private var showUploadErrorDetail = false
     @State private var clearError: String? = nil
+    @State private var expandedFailedIDs: Set<UUID> = []
 
     // MARK: - Body
 
@@ -28,6 +29,7 @@ struct StatusView: View {
                 lastUploadedSection
                 latestWorkoutSection
                 syncSection
+                pendingSection
                 debugSection
                 dangerZoneSection
             }
@@ -117,7 +119,7 @@ struct StatusView: View {
 
     private var latestWorkoutSection: some View {
         Section("Último entrenamiento en Apple Salud") {
-            if healthKitService.isLoading {
+            if healthKitService.isLoading || healthKitService.isLoadingRecent {
                 HStack {
                     ProgressView().padding(.trailing, 6)
                     Text("Cargando...")
@@ -136,19 +138,17 @@ struct StatusView: View {
                 LabeledContent("Ruta GPS", value: routeLabel)
                 LabeledContent("Pulso", value: heartRateLabel)
 
-                if isCurrentWorkoutUploaded {
+                if uploadStore.isUploaded(workoutUUID: workout.id) {
                     HStack(spacing: 6) {
-                        Image(systemName: "checkmark.circle.fill")
-                            .foregroundStyle(.green)
-                        Text("Ya subido")
-                            .foregroundStyle(.green)
+                        Image(systemName: "checkmark.circle.fill").foregroundStyle(.green)
+                        Text("Ya subido").foregroundStyle(.green)
                     }
                     .font(.caption)
                 }
             } else if let err = healthKitService.errorMessage {
-                Text(err)
-                    .font(.caption)
-                    .foregroundStyle(.red)
+                Text(err).font(.caption).foregroundStyle(.red)
+            } else if let err = healthKitService.pendingError {
+                Text(err).font(.caption).foregroundStyle(.red)
             } else {
                 Text("No se ha detectado ningún entrenamiento.")
                     .foregroundStyle(.secondary)
@@ -160,76 +160,74 @@ struct StatusView: View {
 
     private var syncSection: some View {
         Section {
-            if healthKitService.isLoading {
-                // autoLoad en progreso
+            if healthKitService.isLoadingRecent {
                 HStack {
                     ProgressView().padding(.trailing, 6)
-                    Text("Buscando entrenamiento...")
+                    Text("Buscando entrenamientos...")
                         .foregroundStyle(.secondary)
                 }
             } else if healthKitService.isUploading {
-                // Subida en progreso
                 HStack {
                     ProgressView().padding(.trailing, 6)
-                    Text(uploadStepLabel)
-                        .foregroundStyle(.secondary)
+                    Text(uploadStepLabel).foregroundStyle(.secondary)
                 }
             } else if healthKitService.uploadStep == .done {
-                // Éxito
                 HStack(spacing: 8) {
-                    Image(systemName: "checkmark.circle.fill")
-                        .foregroundStyle(.green)
+                    Image(systemName: "checkmark.circle.fill").foregroundStyle(.green)
                     Text("Entrenamiento subido correctamente")
-                        .foregroundStyle(.green)
-                        .fontWeight(.medium)
+                        .foregroundStyle(.green).fontWeight(.medium)
                 }
-            } else if healthKitService.latestWorkout == nil {
-                // Sin workout: botón de búsqueda manual
+            } else if !isHealthKitAvailable {
                 Button {
                     Task { await healthKitService.fetchLatestWorkout() }
                 } label: {
-                    Text("Buscar entrenamiento")
-                        .frame(maxWidth: .infinity)
+                    Text("Buscar entrenamiento").frame(maxWidth: .infinity)
                 }
                 .disabled(!isHealthKitAvailable)
-            } else if isCurrentWorkoutUploaded {
-                // Todo sincronizado
+            } else if healthKitService.pendingCount == 0 && !healthKitService.recentWorkouts.isEmpty {
                 HStack(spacing: 8) {
-                    Image(systemName: "checkmark.circle.fill")
-                        .foregroundStyle(.green)
+                    Image(systemName: "checkmark.circle.fill").foregroundStyle(.green)
                     VStack(alignment: .leading, spacing: 2) {
-                        Text("Todo sincronizado")
-                            .fontWeight(.medium)
-                        Text("El último entrenamiento ya está en Endurain.")
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
+                        Text("Todo sincronizado").fontWeight(.medium)
+                        Text("Todos los entrenamientos recientes están en Endurain.")
+                            .font(.caption).foregroundStyle(.secondary)
                     }
                 }
-            } else {
-                // Hay workout nuevo sin subir
+            } else if healthKitService.pendingCount > 0 {
+                if healthKitService.pendingCount > 1 {
+                    Text("\(healthKitService.pendingCount) entrenamientos pendientes")
+                        .font(.caption).foregroundStyle(.secondary)
+                }
                 Button {
                     showUploadErrorDetail = false
-                    Task { await healthKitService.uploadWorkout(uploadStore: uploadStore, settings: store) }
+                    Task {
+                        await healthKitService.uploadNextPending(
+                            uploadStore: uploadStore,
+                            settings: store
+                        )
+                    }
                 } label: {
-                    Text("Subir entrenamiento nuevo")
-                        .frame(maxWidth: .infinity)
+                    Text("Subir siguiente pendiente").frame(maxWidth: .infinity)
                 }
                 .buttonStyle(.borderedProminent)
-                .disabled(uploadButtonDisabled)
+                .disabled(healthKitService.isUploading)
+            } else {
+                // recentWorkouts vacío — buscar manualmente
+                Button {
+                    Task {
+                        await healthKitService.fetchRecentWorkouts(uploadStore: uploadStore)
+                    }
+                } label: {
+                    Text("Buscar entrenamientos recientes").frame(maxWidth: .infinity)
+                }
             }
 
-            // Error de subida
             if let errMsg = healthKitService.uploadErrorMessage {
-                Text(errMsg)
-                    .font(.caption)
-                    .foregroundStyle(.red)
-
+                Text(errMsg).font(.caption).foregroundStyle(.red)
                 if let detail = healthKitService.uploadErrorDetail {
                     DisclosureGroup("Detalle técnico", isExpanded: $showUploadErrorDetail) {
                         Text(detail)
-                            .font(.caption2)
-                            .foregroundStyle(.secondary)
-                            .textSelection(.enabled)
+                            .font(.caption2).foregroundStyle(.secondary).textSelection(.enabled)
                     }
                     .font(.caption)
                 }
@@ -238,14 +236,139 @@ struct StatusView: View {
         } header: {
             Text("Sincronización")
         } footer: {
-            if healthKitService.latestWorkout != nil && !isCurrentWorkoutUploaded
-                && !healthKitService.isUploading && healthKitService.uploadStep != .done {
+            if healthKitService.pendingCount > 0 && !healthKitService.isUploading {
                 Text("Se usa la API key configurada en Ajustes.")
             }
         }
     }
 
-    // MARK: - Debug section (colapsable)
+    // MARK: - Pending workouts section
+
+    private var pendingSection: some View {
+        Section {
+            if healthKitService.isLoadingRecent {
+                HStack {
+                    ProgressView().padding(.trailing, 6)
+                    Text("Cargando entrenamientos...").foregroundStyle(.secondary)
+                }
+            } else if healthKitService.recentWorkouts.isEmpty {
+                if let err = healthKitService.pendingError {
+                    Text(err).font(.caption).foregroundStyle(.red)
+                } else {
+                    Text("No hay entrenamientos en los últimos \(HealthKitService.recentDaysWindow) días.")
+                        .foregroundStyle(.secondary)
+                }
+            } else {
+                ForEach(healthKitService.recentWorkouts) { workout in
+                    pendingWorkoutRow(workout)
+                }
+            }
+        } header: {
+            HStack {
+                Text("Pendientes recientes (\(HealthKitService.recentDaysWindow) días)")
+                Spacer()
+                if !healthKitService.isLoadingRecent {
+                    Button {
+                        Task {
+                            await healthKitService.fetchRecentWorkouts(uploadStore: uploadStore)
+                        }
+                    } label: {
+                        Image(systemName: "arrow.clockwise")
+                            .font(.caption)
+                    }
+                    .buttonStyle(.plain)
+                }
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func pendingWorkoutRow(_ workout: PendingWorkout) -> some View {
+        VStack(alignment: .leading, spacing: 4) {
+            HStack(alignment: .top) {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(workout.activityTypeName)
+                        .fontWeight(.medium)
+                    Text(workout.startDate, format: .dateTime)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    HStack(spacing: 8) {
+                        Text(formattedDuration(workout.durationSeconds))
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                        if let dist = workout.totalDistanceMeters {
+                            Text(formattedDistance(dist))
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+                }
+                Spacer()
+                statusBadge(for: workout)
+            }
+
+            // Error inline expandible
+            if let msg = workout.failedMessage {
+                DisclosureGroup(
+                    isExpanded: Binding(
+                        get: { expandedFailedIDs.contains(workout.id) },
+                        set: { expanded in
+                            if expanded { expandedFailedIDs.insert(workout.id) }
+                            else { expandedFailedIDs.remove(workout.id) }
+                        }
+                    )
+                ) {
+                    Text(msg)
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                        .textSelection(.enabled)
+                        .padding(.top, 2)
+                } label: {
+                    Text("Ver error")
+                        .font(.caption)
+                        .foregroundStyle(.red)
+                }
+
+                Button {
+                    Task {
+                        await healthKitService.uploadPendingWorkout(
+                            workout,
+                            uploadStore: uploadStore,
+                            settings: store
+                        )
+                    }
+                } label: {
+                    Text("Reintentar")
+                        .font(.caption)
+                        .frame(maxWidth: .infinity)
+                }
+                .buttonStyle(.bordered)
+                .tint(.orange)
+                .disabled(healthKitService.isUploading)
+            }
+        }
+        .padding(.vertical, 2)
+    }
+
+    @ViewBuilder
+    private func statusBadge(for workout: PendingWorkout) -> some View {
+        switch workout.uploadStatus {
+        case .pending:
+            Label("Pendiente", systemImage: "arrow.up.circle")
+                .font(.caption)
+                .foregroundStyle(.orange)
+        case .uploaded:
+            Label("Subido", systemImage: "checkmark.circle.fill")
+                .font(.caption)
+                .foregroundStyle(.green)
+        case .failed:
+            Label("Error", systemImage: "exclamationmark.circle.fill")
+                .font(.caption)
+                .foregroundStyle(.red)
+        }
+    }
+
+    // MARK: - Debug section
 
     private var debugSection: some View {
         Section {
@@ -265,20 +388,16 @@ struct StatusView: View {
                 .disabled(healthKitService.latestWorkout == nil || healthKitService.isGeneratingTCX)
 
                 if let tcxError = healthKitService.tcxErrorMessage {
-                    Text(tcxError)
-                        .font(.caption)
-                        .foregroundStyle(.red)
+                    Text(tcxError).font(.caption).foregroundStyle(.red)
                 }
 
                 if let detail = healthKitService.latestWorkoutDetail {
                     LabeledContent("Puntos de ruta", value: "\(detail.routePoints.count)")
                     LabeledContent("Muestras de pulso", value: "\(detail.heartRateSamples.count)")
-
                     if let tcx = healthKitService.tcxString {
                         LabeledContent("Tamaño TCX",
                             value: String(format: "%.1f KB", Double(tcx.utf8.count) / 1024.0))
                     }
-
                     if detail.hasRoute,
                        let first = detail.routePoints.first,
                        let last = detail.routePoints.last {
@@ -286,18 +405,13 @@ struct StatusView: View {
                             Text("Primera: \(coordString(first)) @ \(timeString(first.timestamp))")
                             Text("Última:  \(coordString(last)) @ \(timeString(last.timestamp))")
                         }
-                        .font(.caption2)
-                        .foregroundStyle(.tertiary)
-                        .textSelection(.enabled)
+                        .font(.caption2).foregroundStyle(.tertiary).textSelection(.enabled)
                     }
-
                     if !detail.hasRoute {
-                        Text("Sin ruta GPS asociada.")
-                            .font(.caption).foregroundStyle(.orange)
+                        Text("Sin ruta GPS asociada.").font(.caption).foregroundStyle(.orange)
                     }
                     if !detail.hasHeartRate {
-                        Text("Sin muestras de pulso.")
-                            .font(.caption).foregroundStyle(.secondary)
+                        Text("Sin muestras de pulso.").font(.caption).foregroundStyle(.secondary)
                     }
                 }
 
@@ -323,27 +437,21 @@ struct StatusView: View {
     private var dangerZoneSection: some View {
         Section {
             if let error = clearError {
-                Text(error)
-                    .font(.caption)
-                    .foregroundStyle(.red)
+                Text(error).font(.caption).foregroundStyle(.red)
             }
-
             Button(role: .destructive) {
                 showConfirmClearHistory = true
             } label: {
-                Text("Borrar historial de subidas")
-                    .frame(maxWidth: .infinity)
+                Text("Borrar historial de subidas").frame(maxWidth: .infinity)
             }
             .buttonStyle(.bordered)
 
             Button(role: .destructive) {
                 showConfirmClear = true
             } label: {
-                Text("Borrar configuración")
-                    .frame(maxWidth: .infinity)
+                Text("Borrar configuración").frame(maxWidth: .infinity)
             }
             .buttonStyle(.bordered)
-
         } header: {
             Text("Zona de peligro")
         } footer: {
@@ -351,19 +459,7 @@ struct StatusView: View {
         }
     }
 
-    // MARK: - Upload helpers
-
-    private var isCurrentWorkoutUploaded: Bool {
-        guard let id = healthKitService.latestWorkout?.id else { return false }
-        return uploadStore.isUploaded(workoutUUID: id)
-    }
-
-    private var uploadButtonDisabled: Bool {
-        healthKitService.latestWorkout == nil
-            || healthKitService.isUploading
-            || healthKitService.isGeneratingTCX
-            || isCurrentWorkoutUploaded
-    }
+    // MARK: - Upload step label
 
     private var uploadStepLabel: String {
         switch healthKitService.uploadStep {
@@ -377,7 +473,7 @@ struct StatusView: View {
         }
     }
 
-    // MARK: - Route / HR labels (query ligera)
+    // MARK: - Route / HR labels
 
     private var routeLabel: String {
         switch healthKitService.latestWorkoutHasRoute {
@@ -480,6 +576,12 @@ struct StatusView: View {
             healthKitService.uploadStep = .idle
             healthKitService.uploadErrorMessage = nil
             healthKitService.uploadErrorDetail = nil
+            // Recalcular estados de pending tras borrar historial
+            for i in healthKitService.recentWorkouts.indices {
+                if case .uploaded = healthKitService.recentWorkouts[i].uploadStatus {
+                    healthKitService.recentWorkouts[i].uploadStatus = .pending
+                }
+            }
         } catch {
             clearError = "Error al borrar historial: \(error.localizedDescription)"
         }

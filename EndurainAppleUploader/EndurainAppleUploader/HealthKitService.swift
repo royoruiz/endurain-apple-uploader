@@ -23,11 +23,11 @@ enum HealthKitPermissionStatus {
 
 enum UploadStep: Equatable {
     case idle
-    case readingWorkout   // "Leyendo entrenamiento"
-    case readingRoute     // "Leyendo ruta"
-    case generatingTCX    // "Generando TCX"
-    case uploading        // "Subiendo a Endurain"
-    case savingState      // "Guardando estado"
+    case readingWorkout
+    case readingRoute
+    case generatingTCX
+    case uploading
+    case savingState
     case done
 }
 
@@ -37,17 +37,20 @@ enum UploadStep: Equatable {
 @MainActor
 final class HealthKitService {
 
-    // MARK: - Observable state — workout
+    // MARK: - Constants
+
+    static let recentDaysWindow = 7
+
+    // MARK: - Observable state — workout (último, para sección de detalle)
 
     var latestWorkout: WorkoutSummary? = nil
-    var latestHKWorkout: HKWorkout? = nil       // Opción B: nativo, solo en memoria
+    var latestHKWorkout: HKWorkout? = nil
     var permissionStatus: HealthKitPermissionStatus = .notRequested
     var isLoading: Bool = false
     var errorMessage: String? = nil
 
-    // Query ligera: saber si hay ruta/pulso sin leer todos los puntos
-    var latestWorkoutHasRoute: Bool? = nil      // nil = no verificado aún
-    var latestWorkoutHasHeartRate: Bool? = nil  // nil = no verificado aún
+    var latestWorkoutHasRoute: Bool? = nil
+    var latestWorkoutHasHeartRate: Bool? = nil
 
     // MARK: - Observable state — TCX
 
@@ -65,6 +68,16 @@ final class HealthKitService {
     var uploadErrorDetail: String? = nil
     var lastUploadedAt: Date? = nil
 
+    // MARK: - Observable state — pending workouts (últimos 7 días)
+
+    var recentWorkouts: [PendingWorkout] = []
+    var isLoadingRecent: Bool = false
+    var pendingError: String? = nil
+
+    var pendingCount: Int {
+        recentWorkouts.filter { $0.isPending }.count
+    }
+
     // MARK: - Private
 
     private let store = HKHealthStore()
@@ -80,6 +93,21 @@ final class HealthKitService {
         ]
     }
 
+    // MARK: - Persistence key
+
+    private static let permissionsRequestedKey = "hk_has_requested_permissions"
+
+    // MARK: - Init
+
+    init() {
+        if HKHealthStore.isHealthDataAvailable() {
+            let hasRequested = UserDefaults.standard.bool(forKey: Self.permissionsRequestedKey)
+            permissionStatus = hasRequested ? .available : .notRequested
+        } else {
+            permissionStatus = .unavailable
+        }
+    }
+
     // MARK: - Authorization
 
     func requestAuthorization() async {
@@ -89,6 +117,7 @@ final class HealthKitService {
         }
         do {
             try await store.requestAuthorization(toShare: [], read: readTypes)
+            UserDefaults.standard.set(true, forKey: Self.permissionsRequestedKey)
             permissionStatus = .available
         } catch {
             permissionStatus = .error(error.localizedDescription)
@@ -97,26 +126,253 @@ final class HealthKitService {
 
     // MARK: - Auto load (arranque silencioso)
 
-    /// Solo actúa si ya hay permisos disponibles y no hay workout en memoria.
-    /// No solicita permisos automáticamente — el usuario debe hacerlo explícitamente.
-    func autoLoad() async {
+    /// Solo actúa si hay permisos disponibles. No solicita permisos automáticamente.
+    func autoLoad(uploadStore: UploadStore) async {
         guard case .available = permissionStatus else { return }
-        guard latestWorkout == nil else { return }
-        await fetchLatestWorkout()
+        await fetchRecentWorkouts(uploadStore: uploadStore)
     }
 
-    // MARK: - Fetch Latest Workout
+    // MARK: - Fetch Recent Workouts (últimos N días)
+
+    func fetchRecentWorkouts(uploadStore: UploadStore) async {
+        guard HKHealthStore.isHealthDataAvailable() else {
+            pendingError = "HealthKit no está disponible en este dispositivo."
+            return
+        }
+
+        isLoadingRecent = true
+        pendingError = nil
+
+        do {
+            let workouts = try await queryRecentHKWorkouts()
+
+            // Actualizar el "último entrenamiento" con el primero de la lista
+            if let first = workouts.first {
+                latestHKWorkout = first
+                latestWorkout = WorkoutSummary(
+                    id: first.uuid,
+                    activityTypeName: first.workoutActivityType.displayName,
+                    startDate: first.startDate,
+                    endDate: first.endDate,
+                    durationSeconds: first.duration,
+                    totalDistanceMeters: first.totalDistance?.doubleValue(for: .meter()),
+                    activeEnergyKcal: first.totalEnergyBurned?.doubleValue(for: .kilocalorie())
+                )
+                // Query ligera ruta/pulso solo para el primero
+                async let hasRoute = checkHasRoute(for: first)
+                async let hasHR = checkHasHeartRate(for: first)
+                let (route, hr) = await (hasRoute, hasHR)
+                latestWorkoutHasRoute = route
+                latestWorkoutHasHeartRate = hr
+            } else {
+                latestHKWorkout = nil
+                latestWorkout = nil
+                latestWorkoutHasRoute = nil
+                latestWorkoutHasHeartRate = nil
+            }
+
+            // Construir lista de PendingWorkout con estado calculado
+            recentWorkouts = workouts.map { w in
+                let status: UploadStatus = uploadStore.isUploaded(workoutUUID: w.uuid)
+                    ? .uploaded
+                    : .pending
+                return PendingWorkout(
+                    id: w.uuid,
+                    activityTypeName: w.workoutActivityType.displayName,
+                    startDate: w.startDate,
+                    endDate: w.endDate,
+                    durationSeconds: w.duration,
+                    totalDistanceMeters: w.totalDistance?.doubleValue(for: .meter()),
+                    uploadStatus: status
+                )
+            }
+        } catch {
+            pendingError = error.localizedDescription
+        }
+
+        isLoadingRecent = false
+    }
+
+    // MARK: - Upload next pending
+
+    func uploadNextPending(uploadStore: UploadStore, settings: SettingsStore) async {
+        guard let next = recentWorkouts.first(where: { $0.isPending }) else {
+            uploadErrorMessage = "No hay entrenamientos pendientes."
+            return
+        }
+        await uploadPendingWorkout(next, uploadStore: uploadStore, settings: settings)
+    }
+
+    // MARK: - Upload specific pending (incluye reintentar failed)
+
+    func uploadPendingWorkout(
+        _ pending: PendingWorkout,
+        uploadStore: UploadStore,
+        settings: SettingsStore
+    ) async {
+        guard !uploadStore.isUploaded(workoutUUID: pending.id) else {
+            markPending(pending.id, as: .uploaded)
+            return
+        }
+
+        let resolvedAPIKey: String
+        do {
+            guard let k = try settings.readAPIKey(), !k.isEmpty else {
+                let msg = "No se encontró la API key. Revisa la configuración."
+                markPending(pending.id, as: .failed(msg))
+                uploadErrorMessage = msg
+                return
+            }
+            resolvedAPIKey = k
+        } catch {
+            let msg = "Error al leer la API key: \(error.localizedDescription)"
+            markPending(pending.id, as: .failed(msg))
+            uploadErrorMessage = msg
+            return
+        }
+
+        isUploading = true
+        uploadErrorMessage = nil
+        uploadErrorDetail = nil
+        defer { isUploading = false }
+
+        do {
+            // 1. Recuperar HKWorkout nativo
+            uploadStep = .readingWorkout
+            guard let workout = try await fetchHKWorkout(uuid: pending.id) else {
+                let msg = "No se encontró el entrenamiento en HealthKit."
+                markPending(pending.id, as: .failed(msg))
+                uploadErrorMessage = msg
+                uploadStep = .idle
+                return
+            }
+
+            // Actualizar latestHKWorkout si es el primero
+            if latestWorkout?.id == pending.id {
+                latestHKWorkout = workout
+            }
+
+            // 2. Leer ruta completa
+            uploadStep = .readingRoute
+            let locations = try await fetchRoutes(for: workout)
+            let hrSamples = try await fetchHeartRateSamples(for: workout)
+
+            let points: [RoutePoint] = locations.map { loc in
+                RoutePoint(
+                    timestamp: loc.timestamp,
+                    latitude: loc.coordinate.latitude,
+                    longitude: loc.coordinate.longitude,
+                    altitude: loc.verticalAccuracy >= 0 ? loc.altitude : nil,
+                    horizontalAccuracy: loc.horizontalAccuracy >= 0 ? loc.horizontalAccuracy : nil
+                )
+            }
+
+            let detail = WorkoutDetail(
+                id: workout.uuid,
+                activityType: workout.workoutActivityType,
+                activityTypeName: workout.workoutActivityType.displayName,
+                startDate: workout.startDate,
+                endDate: workout.endDate,
+                durationSeconds: workout.duration,
+                totalDistanceMeters: workout.totalDistance?.doubleValue(for: .meter()),
+                activeEnergyKcal: workout.totalEnergyBurned?.doubleValue(for: .kilocalorie()),
+                routePoints: points,
+                heartRateSamples: hrSamples
+            )
+
+            // Actualizar estado del detalle si es el último visible
+            if latestWorkout?.id == pending.id {
+                latestWorkoutDetail = detail
+                latestWorkoutHasRoute = detail.hasRoute
+                latestWorkoutHasHeartRate = detail.hasHeartRate
+            }
+
+            // 3. Generar TCX
+            uploadStep = .generatingTCX
+            let tcx = TCXGenerator.generate(from: detail)
+            guard let tcxData = tcx.data(using: .utf8) else {
+                let msg = "Error al codificar el TCX."
+                markPending(pending.id, as: .failed(msg))
+                uploadErrorMessage = msg
+                uploadStep = .idle
+                return
+            }
+
+            if latestWorkout?.id == pending.id {
+                tcxString = tcx
+                tcxFileURL = try? writeTCXToTemp(tcx, uuid: detail.id)
+            }
+
+            let filename = "apple-health-\(workout.uuid.uuidString.lowercased()).tcx"
+
+            // 4. Subir a Endurain
+            uploadStep = .uploading
+            let client = EndurainClient(serverURL: settings.serverURL, apiKey: resolvedAPIKey)
+            _ = try await client.uploadActivityTCX(tcxData: tcxData, filename: filename)
+
+            // 5. Guardar estado local
+            uploadStep = .savingState
+            let record = UploadRecord(
+                id: workout.uuid,
+                startDate: workout.startDate,
+                endDate: workout.endDate,
+                uploadedAt: Date(),
+                filename: filename,
+                serverURL: settings.serverURL,
+                activityTypeName: pending.activityTypeName,
+                durationSeconds: pending.durationSeconds,
+                totalDistanceMeters: pending.totalDistanceMeters
+            )
+            try uploadStore.save(record: record)
+            lastUploadedAt = record.uploadedAt
+
+            markPending(pending.id, as: .uploaded)
+            uploadStep = .done
+
+        } catch let error as EndurainClientError {
+            let msg = error.errorDescription ?? error.localizedDescription
+            markPending(pending.id, as: .failed(msg))
+            uploadErrorMessage = msg
+            if case .uploadError(let code, let body) = error {
+                uploadErrorDetail = "HTTP \(code)\n\(body)"
+            }
+            uploadStep = .idle
+        } catch {
+            let msg = error.localizedDescription
+            markPending(pending.id, as: .failed(msg))
+            uploadErrorMessage = msg
+            uploadStep = .idle
+        }
+    }
+
+    // MARK: - Legacy uploadWorkout (compatibilidad Fase 4/5, delega en uploadPendingWorkout)
+
+    func uploadWorkout(uploadStore: UploadStore, settings: SettingsStore) async {
+        guard let workout = latestWorkout else {
+            uploadErrorMessage = "Primero busca un entrenamiento."
+            return
+        }
+        let pending = PendingWorkout(
+            id: workout.id,
+            activityTypeName: workout.activityTypeName,
+            startDate: workout.startDate,
+            endDate: workout.endDate,
+            durationSeconds: workout.durationSeconds,
+            totalDistanceMeters: workout.totalDistanceMeters,
+            uploadStatus: .pending
+        )
+        await uploadPendingWorkout(pending, uploadStore: uploadStore, settings: settings)
+    }
+
+    // MARK: - Fetch Latest Workout (manual refresh, actualiza también recentWorkouts)
 
     func fetchLatestWorkout() async {
         guard HKHealthStore.isHealthDataAvailable() else {
             errorMessage = "HealthKit no está disponible en este dispositivo."
             return
         }
-
         isLoading = true
         errorMessage = nil
-
-        // Resetear estado derivado al buscar workout nuevo
         latestWorkoutHasRoute = nil
         latestWorkoutHasHeartRate = nil
         tcxString = nil
@@ -139,7 +395,6 @@ final class HealthKitService {
                     totalDistanceMeters: workout.totalDistance?.doubleValue(for: .meter()),
                     activeEnergyKcal: workout.totalEnergyBurned?.doubleValue(for: .kilocalorie())
                 )
-                // Query ligera: comprobar presencia de ruta y pulso
                 async let hasRoute = checkHasRoute(for: workout)
                 async let hasHR = checkHasHeartRate(for: workout)
                 let (route, hr) = await (hasRoute, hasHR)
@@ -152,8 +407,198 @@ final class HealthKitService {
         } catch {
             errorMessage = error.localizedDescription
         }
-
         isLoading = false
+    }
+
+    // MARK: - Generate TCX (standalone debug)
+
+    func generateTCX() async {
+        guard let workout = latestHKWorkout else {
+            tcxErrorMessage = "Primero busca un entrenamiento."
+            return
+        }
+        isGeneratingTCX = true
+        tcxErrorMessage = nil
+        defer { isGeneratingTCX = false }
+        do {
+            let detail = try await buildWorkoutDetail(for: workout)
+            latestWorkoutDetail = detail
+            let tcx = TCXGenerator.generate(from: detail)
+            tcxString = tcx
+            tcxFileURL = try writeTCXToTemp(tcx, uuid: detail.id)
+        } catch {
+            tcxErrorMessage = error.localizedDescription
+        }
+    }
+
+    // MARK: - Build WorkoutDetail
+
+    func buildWorkoutDetail(for workout: HKWorkout) async throws -> WorkoutDetail {
+        async let routeLocations = fetchRoutes(for: workout)
+        async let hrSamples = fetchHeartRateSamples(for: workout)
+        let (locations, samples) = try await (routeLocations, hrSamples)
+        let points: [RoutePoint] = locations.map { loc in
+            RoutePoint(
+                timestamp: loc.timestamp,
+                latitude: loc.coordinate.latitude,
+                longitude: loc.coordinate.longitude,
+                altitude: loc.verticalAccuracy >= 0 ? loc.altitude : nil,
+                horizontalAccuracy: loc.horizontalAccuracy >= 0 ? loc.horizontalAccuracy : nil
+            )
+        }
+        return WorkoutDetail(
+            id: workout.uuid,
+            activityType: workout.workoutActivityType,
+            activityTypeName: workout.workoutActivityType.displayName,
+            startDate: workout.startDate,
+            endDate: workout.endDate,
+            durationSeconds: workout.duration,
+            totalDistanceMeters: workout.totalDistance?.doubleValue(for: .meter()),
+            activeEnergyKcal: workout.totalEnergyBurned?.doubleValue(for: .kilocalorie()),
+            routePoints: points,
+            heartRateSamples: samples
+        )
+    }
+
+    // MARK: - Fetch Routes
+
+    func fetchRoutes(for workout: HKWorkout) async throws -> [CLLocation] {
+        let routes: [HKWorkoutRoute] = try await withCheckedThrowingContinuation { continuation in
+            let predicate = HKQuery.predicateForObjects(from: workout)
+            let query = HKSampleQuery(
+                sampleType: HKSeriesType.workoutRoute(),
+                predicate: predicate,
+                limit: HKObjectQueryNoLimit,
+                sortDescriptors: nil
+            ) { _, samples, error in
+                if let error { continuation.resume(throwing: error); return }
+                continuation.resume(returning: (samples as? [HKWorkoutRoute]) ?? [])
+            }
+            store.execute(query)
+        }
+        guard !routes.isEmpty else { return [] }
+        var allLocations: [CLLocation] = []
+        for route in routes {
+            let locations = try await fetchLocations(for: route)
+            allLocations.append(contentsOf: locations)
+        }
+        allLocations.sort { $0.timestamp < $1.timestamp }
+        return allLocations
+    }
+
+    private func fetchLocations(for route: HKWorkoutRoute) async throws -> [CLLocation] {
+        try await withCheckedThrowingContinuation { continuation in
+            var accumulated: [CLLocation] = []
+            var didResume = false
+            let query = HKWorkoutRouteQuery(route: route) { _, locations, done, error in
+                if let error {
+                    if !didResume { didResume = true; continuation.resume(throwing: error) }
+                    return
+                }
+                if let locations { accumulated.append(contentsOf: locations) }
+                if done, !didResume {
+                    didResume = true
+                    continuation.resume(returning: accumulated)
+                }
+            }
+            store.execute(query)
+        }
+    }
+
+    // MARK: - Fetch Heart Rate
+
+    func fetchHeartRateSamples(for workout: HKWorkout) async throws -> [HeartRateSample] {
+        try await withCheckedThrowingContinuation { continuation in
+            let predicate = HKQuery.predicateForSamples(
+                withStart: workout.startDate,
+                end: workout.endDate,
+                options: .strictStartDate
+            )
+            let sortDescriptor = NSSortDescriptor(key: HKSampleSortIdentifierStartDate, ascending: true)
+            let query = HKSampleQuery(
+                sampleType: HKQuantityType(.heartRate),
+                predicate: predicate,
+                limit: HKObjectQueryNoLimit,
+                sortDescriptors: [sortDescriptor]
+            ) { _, samples, error in
+                if let error { continuation.resume(throwing: error); return }
+                let hrSamples: [HeartRateSample] = (samples as? [HKQuantitySample] ?? []).map { s in
+                    HeartRateSample(
+                        timestamp: s.startDate,
+                        bpm: s.quantity.doubleValue(for: HKUnit.count().unitDivided(by: .minute()))
+                    )
+                }
+                continuation.resume(returning: hrSamples)
+            }
+            store.execute(query)
+        }
+    }
+
+    // MARK: - Private queries
+
+    private func queryRecentHKWorkouts() async throws -> [HKWorkout] {
+        try await withCheckedThrowingContinuation { continuation in
+            let now = Date()
+            let start = Calendar.current.date(
+                byAdding: .day,
+                value: -HealthKitService.recentDaysWindow,
+                to: now
+            ) ?? now
+            let predicate = HKQuery.predicateForSamples(
+                withStart: start,
+                end: now,
+                options: .strictStartDate
+            )
+            let sortDescriptor = NSSortDescriptor(
+                key: HKSampleSortIdentifierEndDate,
+                ascending: false
+            )
+            let query = HKSampleQuery(
+                sampleType: HKObjectType.workoutType(),
+                predicate: predicate,
+                limit: HKObjectQueryNoLimit,
+                sortDescriptors: [sortDescriptor]
+            ) { _, samples, error in
+                if let error { continuation.resume(throwing: error); return }
+                continuation.resume(returning: (samples as? [HKWorkout]) ?? [])
+            }
+            store.execute(query)
+        }
+    }
+
+    private func queryLatestHKWorkout() async throws -> HKWorkout? {
+        try await withCheckedThrowingContinuation { continuation in
+            let sortDescriptor = NSSortDescriptor(
+                key: HKSampleSortIdentifierEndDate,
+                ascending: false
+            )
+            let query = HKSampleQuery(
+                sampleType: HKObjectType.workoutType(),
+                predicate: nil,
+                limit: 1,
+                sortDescriptors: [sortDescriptor]
+            ) { _, samples, error in
+                if let error { continuation.resume(throwing: error); return }
+                continuation.resume(returning: samples?.first as? HKWorkout)
+            }
+            store.execute(query)
+        }
+    }
+
+    private func fetchHKWorkout(uuid: UUID) async throws -> HKWorkout? {
+        try await withCheckedThrowingContinuation { continuation in
+            let predicate = HKQuery.predicateForObject(with: uuid)
+            let query = HKSampleQuery(
+                sampleType: HKObjectType.workoutType(),
+                predicate: predicate,
+                limit: 1,
+                sortDescriptors: nil
+            ) { _, samples, error in
+                if let error { continuation.resume(throwing: error); return }
+                continuation.resume(returning: samples?.first as? HKWorkout)
+            }
+            store.execute(query)
+        }
     }
 
     // MARK: - Query ligera: ¿existe ruta?
@@ -194,291 +639,13 @@ final class HealthKitService {
         }
     }
 
-    // MARK: - Generate TCX (standalone, para debug/inspección)
+    // MARK: - Helpers
 
-    func generateTCX() async {
-        guard let workout = latestHKWorkout else {
-            tcxErrorMessage = "Primero busca un entrenamiento."
-            return
-        }
-
-        isGeneratingTCX = true
-        tcxErrorMessage = nil
-        defer { isGeneratingTCX = false }
-
-        do {
-            let detail = try await buildWorkoutDetail(for: workout)
-            latestWorkoutDetail = detail
-            let tcx = TCXGenerator.generate(from: detail)
-            tcxString = tcx
-            tcxFileURL = try writeTCXToTemp(tcx, uuid: detail.id)
-        } catch {
-            tcxErrorMessage = error.localizedDescription
+    private func markPending(_ id: UUID, as status: UploadStatus) {
+        if let idx = recentWorkouts.firstIndex(where: { $0.id == id }) {
+            recentWorkouts[idx].uploadStatus = status
         }
     }
-
-    // MARK: - Upload workout
-
-    func uploadWorkout(uploadStore: UploadStore, settings: SettingsStore) async {
-        guard let workout = latestHKWorkout else {
-            uploadErrorMessage = "Primero busca un entrenamiento."
-            return
-        }
-
-        guard !uploadStore.isUploaded(workoutUUID: workout.uuid) else {
-            uploadErrorMessage = "Este entrenamiento ya está subido a Endurain."
-            return
-        }
-
-        let resolvedAPIKey: String
-        do {
-            guard let k = try settings.readAPIKey(), !k.isEmpty else {
-                uploadErrorMessage = "No se encontró la API key. Revisa la configuración."
-                return
-            }
-            resolvedAPIKey = k
-        } catch {
-            uploadErrorMessage = "Error al leer la API key: \(error.localizedDescription)"
-            return
-        }
-
-        isUploading = true
-        uploadErrorMessage = nil
-        uploadErrorDetail = nil
-        defer { isUploading = false }
-
-        do {
-            // 1. Leer entrenamiento base
-            uploadStep = .readingWorkout
-            let summary = latestWorkout
-
-            // 2. Leer ruta completa
-            uploadStep = .readingRoute
-            let locations = try await fetchRoutes(for: workout)
-            let hrSamples = try await fetchHeartRateSamples(for: workout)
-
-            let points: [RoutePoint] = locations.map { loc in
-                RoutePoint(
-                    timestamp: loc.timestamp,
-                    latitude: loc.coordinate.latitude,
-                    longitude: loc.coordinate.longitude,
-                    altitude: loc.verticalAccuracy >= 0 ? loc.altitude : nil,
-                    horizontalAccuracy: loc.horizontalAccuracy >= 0 ? loc.horizontalAccuracy : nil
-                )
-            }
-
-            let detail = WorkoutDetail(
-                id: workout.uuid,
-                activityType: workout.workoutActivityType,
-                activityTypeName: workout.workoutActivityType.displayName,
-                startDate: workout.startDate,
-                endDate: workout.endDate,
-                durationSeconds: workout.duration,
-                totalDistanceMeters: workout.totalDistance?.doubleValue(for: .meter()),
-                activeEnergyKcal: workout.totalEnergyBurned?.doubleValue(for: .kilocalorie()),
-                routePoints: points,
-                heartRateSamples: hrSamples
-            )
-
-            // Actualizar estado observable del detalle
-            latestWorkoutDetail = detail
-            latestWorkoutHasRoute = detail.hasRoute
-            latestWorkoutHasHeartRate = detail.hasHeartRate
-
-            // 3. Generar TCX
-            uploadStep = .generatingTCX
-            let tcx = TCXGenerator.generate(from: detail)
-            guard let tcxData = tcx.data(using: .utf8) else {
-                uploadErrorMessage = "Error al codificar el TCX."
-                uploadStep = .idle
-                return
-            }
-            tcxString = tcx
-            tcxFileURL = try? writeTCXToTemp(tcx, uuid: detail.id)
-
-            let filename = "apple-health-\(workout.uuid.uuidString.lowercased()).tcx"
-
-            // 4. Subir a Endurain
-            uploadStep = .uploading
-            let client = EndurainClient(serverURL: settings.serverURL, apiKey: resolvedAPIKey)
-            _ = try await client.uploadActivityTCX(tcxData: tcxData, filename: filename)
-
-            // 5. Guardar estado local
-            uploadStep = .savingState
-            let record = UploadRecord(
-                id: workout.uuid,
-                startDate: workout.startDate,
-                endDate: workout.endDate,
-                uploadedAt: Date(),
-                filename: filename,
-                serverURL: settings.serverURL,
-                activityTypeName: summary?.activityTypeName,
-                durationSeconds: summary?.durationSeconds,
-                totalDistanceMeters: summary?.totalDistanceMeters
-            )
-            try uploadStore.save(record: record)
-            lastUploadedAt = record.uploadedAt
-
-            uploadStep = .done
-
-        } catch let error as EndurainClientError {
-            uploadErrorMessage = error.errorDescription ?? error.localizedDescription
-            if case .uploadError(let code, let body) = error {
-                uploadErrorDetail = "HTTP \(code)\n\(body)"
-            }
-            uploadStep = .idle
-        } catch {
-            uploadErrorMessage = error.localizedDescription
-            uploadStep = .idle
-        }
-    }
-
-    // MARK: - Build WorkoutDetail (usado por generateTCX standalone)
-
-    func buildWorkoutDetail(for workout: HKWorkout) async throws -> WorkoutDetail {
-        async let routeLocations = fetchRoutes(for: workout)
-        async let hrSamples = fetchHeartRateSamples(for: workout)
-
-        let (locations, samples) = try await (routeLocations, hrSamples)
-
-        let points: [RoutePoint] = locations.map { loc in
-            RoutePoint(
-                timestamp: loc.timestamp,
-                latitude: loc.coordinate.latitude,
-                longitude: loc.coordinate.longitude,
-                altitude: loc.verticalAccuracy >= 0 ? loc.altitude : nil,
-                horizontalAccuracy: loc.horizontalAccuracy >= 0 ? loc.horizontalAccuracy : nil
-            )
-        }
-
-        return WorkoutDetail(
-            id: workout.uuid,
-            activityType: workout.workoutActivityType,
-            activityTypeName: workout.workoutActivityType.displayName,
-            startDate: workout.startDate,
-            endDate: workout.endDate,
-            durationSeconds: workout.duration,
-            totalDistanceMeters: workout.totalDistance?.doubleValue(for: .meter()),
-            activeEnergyKcal: workout.totalEnergyBurned?.doubleValue(for: .kilocalorie()),
-            routePoints: points,
-            heartRateSamples: samples
-        )
-    }
-
-    // MARK: - Fetch Routes
-
-    func fetchRoutes(for workout: HKWorkout) async throws -> [CLLocation] {
-        let routes: [HKWorkoutRoute] = try await withCheckedThrowingContinuation { continuation in
-            let predicate = HKQuery.predicateForObjects(from: workout)
-            let query = HKSampleQuery(
-                sampleType: HKSeriesType.workoutRoute(),
-                predicate: predicate,
-                limit: HKObjectQueryNoLimit,
-                sortDescriptors: nil
-            ) { _, samples, error in
-                if let error {
-                    continuation.resume(throwing: error)
-                    return
-                }
-                continuation.resume(returning: (samples as? [HKWorkoutRoute]) ?? [])
-            }
-            store.execute(query)
-        }
-
-        guard !routes.isEmpty else { return [] }
-
-        var allLocations: [CLLocation] = []
-        for route in routes {
-            let locations = try await fetchLocations(for: route)
-            allLocations.append(contentsOf: locations)
-        }
-        allLocations.sort { $0.timestamp < $1.timestamp }
-        return allLocations
-    }
-
-    private func fetchLocations(for route: HKWorkoutRoute) async throws -> [CLLocation] {
-        try await withCheckedThrowingContinuation { continuation in
-            var accumulated: [CLLocation] = []
-            var didResume = false
-
-            let query = HKWorkoutRouteQuery(route: route) { _, locations, done, error in
-                if let error {
-                    if !didResume {
-                        didResume = true
-                        continuation.resume(throwing: error)
-                    }
-                    return
-                }
-                if let locations { accumulated.append(contentsOf: locations) }
-                if done, !didResume {
-                    didResume = true
-                    continuation.resume(returning: accumulated)
-                }
-            }
-            store.execute(query)
-        }
-    }
-
-    // MARK: - Fetch Heart Rate
-
-    func fetchHeartRateSamples(for workout: HKWorkout) async throws -> [HeartRateSample] {
-        try await withCheckedThrowingContinuation { continuation in
-            let predicate = HKQuery.predicateForSamples(
-                withStart: workout.startDate,
-                end: workout.endDate,
-                options: .strictStartDate
-            )
-            let sortDescriptor = NSSortDescriptor(
-                key: HKSampleSortIdentifierStartDate,
-                ascending: true
-            )
-            let query = HKSampleQuery(
-                sampleType: HKQuantityType(.heartRate),
-                predicate: predicate,
-                limit: HKObjectQueryNoLimit,
-                sortDescriptors: [sortDescriptor]
-            ) { _, samples, error in
-                if let error {
-                    continuation.resume(throwing: error)
-                    return
-                }
-                let hrSamples: [HeartRateSample] = (samples as? [HKQuantitySample] ?? []).map { s in
-                    HeartRateSample(
-                        timestamp: s.startDate,
-                        bpm: s.quantity.doubleValue(for: HKUnit.count().unitDivided(by: .minute()))
-                    )
-                }
-                continuation.resume(returning: hrSamples)
-            }
-            store.execute(query)
-        }
-    }
-
-    // MARK: - Private HKWorkout query
-
-    private func queryLatestHKWorkout() async throws -> HKWorkout? {
-        try await withCheckedThrowingContinuation { continuation in
-            let sortDescriptor = NSSortDescriptor(
-                key: HKSampleSortIdentifierEndDate,
-                ascending: false
-            )
-            let query = HKSampleQuery(
-                sampleType: HKObjectType.workoutType(),
-                predicate: nil,
-                limit: 1,
-                sortDescriptors: [sortDescriptor]
-            ) { _, samples, error in
-                if let error {
-                    continuation.resume(throwing: error)
-                    return
-                }
-                continuation.resume(returning: samples?.first as? HKWorkout)
-            }
-            store.execute(query)
-        }
-    }
-
-    // MARK: - Write TCX to temp file
 
     private func writeTCXToTemp(_ tcx: String, uuid: UUID) throws -> URL {
         let tempDir = FileManager.default.temporaryDirectory
