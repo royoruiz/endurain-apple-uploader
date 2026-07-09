@@ -10,7 +10,7 @@ import HealthKit
 
 // MARK: - RoutePoint
 
-struct RoutePoint {
+struct RoutePoint: Sendable {
     let timestamp: Date
     let latitude: Double
     let longitude: Double
@@ -20,14 +20,14 @@ struct RoutePoint {
 
 // MARK: - HeartRateSample
 
-struct HeartRateSample {
+struct HeartRateSample: Sendable {
     let timestamp: Date
     let bpm: Double
 }
 
 // MARK: - WorkoutDetail
 
-struct WorkoutDetail {
+struct WorkoutDetail: @unchecked Sendable {
     let id: UUID
     let activityType: HKWorkoutActivityType
     let activityTypeName: String

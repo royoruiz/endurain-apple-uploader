@@ -12,14 +12,21 @@ struct ContentView: View {
     var store: SettingsStore
     var healthKitService: HealthKitService
     var uploadStore: UploadStore
+    var syncEngine: SyncEngine
+    var healthKitBackgroundObserver: HealthKitBackgroundObserver
 
     var body: some View {
         if store.isConfigured {
-            StatusView(store: store, healthKitService: healthKitService, uploadStore: uploadStore)
+            StatusView(
+                store: store,
+                healthKitService: healthKitService,
+                syncEngine: syncEngine,
+                healthKitBackgroundObserver: healthKitBackgroundObserver
+            )
                 .task {
-                    // Arranque silencioso: carga entrenamientos recientes si hay permisos.
-                    // No solicita permisos automáticamente — acción consciente del usuario.
-                    await healthKitService.autoLoad(uploadStore: uploadStore)
+                    // Al abrir la app: sincronización automática si hay permisos.
+                    // SyncEngine escanea desde 2000-01-01 y sube los pendientes.
+                    await syncEngine.startSync()
                 }
         } else {
             SettingsView(store: store)
@@ -28,9 +35,20 @@ struct ContentView: View {
 }
 
 #Preview {
+    let settings = SettingsStore()
+    let hk = HealthKitService()
+    let queue = try! SyncQueueStore()
+    let backgroundUploads = BackgroundUploadService(queue: queue)
     ContentView(
-        store: SettingsStore(),
-        healthKitService: HealthKitService(),
-        uploadStore: UploadStore()
+        store: settings,
+        healthKitService: hk,
+        uploadStore: UploadStore(),
+        syncEngine: SyncEngine(
+            hkService: hk,
+            queue: queue,
+            settings: settings,
+            backgroundUploadService: backgroundUploads
+        ),
+        healthKitBackgroundObserver: HealthKitBackgroundObserver()
     )
 }

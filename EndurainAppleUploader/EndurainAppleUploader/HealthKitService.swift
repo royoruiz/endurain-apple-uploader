@@ -132,6 +132,21 @@ final class HealthKitService {
         await fetchRecentWorkouts(uploadStore: uploadStore)
     }
 
+    // MARK: - Auto sync (arranque + subida automática)
+
+    /// Carga recientes y sube todos los pendientes uno a uno.
+    /// Llamado desde ContentView.task al abrir la app.
+    func autoSync(uploadStore: UploadStore, settings: SettingsStore) async {
+        guard case .available = permissionStatus else { return }
+        await fetchRecentWorkouts(uploadStore: uploadStore)
+        // Subir pendientes en orden hasta que no queden más
+        while recentWorkouts.contains(where: { $0.isPending }) && !isUploading {
+            await uploadNextPending(uploadStore: uploadStore, settings: settings)
+            // Si el último intento falló (uploadStep == .idle con error), detener el bucle
+            if uploadErrorMessage != nil { break }
+        }
+    }
+
     // MARK: - Fetch Recent Workouts (últimos N días)
 
     func fetchRecentWorkouts(uploadStore: UploadStore) async {
@@ -566,6 +581,38 @@ final class HealthKitService {
         }
     }
 
+    // MARK: - Fetch all workouts since the beginning of time (para scan completo)
+    //
+    // Ordena por startDate ascendente para procesar del más antiguo al más nuevo.
+    // Esto garantiza que si la app se interrumpe, al reanudar los más recientes
+    // siguen pendientes y el progreso es visible para el usuario.
+    //
+    func fetchWorkoutsSinceBeginning() async throws -> [HKWorkout] {
+        try await withCheckedThrowingContinuation { continuation in
+            // Calendar(2000-01-01) como límite inferior práctico
+            var components = DateComponents()
+            components.year = 2000; components.month = 1; components.day = 1
+            let epoch = Calendar.current.date(from: components) ?? .distantPast
+
+            let predicate = HKQuery.predicateForSamples(
+                withStart: epoch,
+                end: Date(),
+                options: .strictStartDate
+            )
+            let sort = NSSortDescriptor(key: HKSampleSortIdentifierStartDate, ascending: true)
+            let query = HKSampleQuery(
+                sampleType: HKObjectType.workoutType(),
+                predicate: predicate,
+                limit: HKObjectQueryNoLimit,
+                sortDescriptors: [sort]
+            ) { _, samples, error in
+                if let error { continuation.resume(throwing: error); return }
+                continuation.resume(returning: (samples as? [HKWorkout]) ?? [])
+            }
+            store.execute(query)
+        }
+    }
+
     private func queryLatestHKWorkout() async throws -> HKWorkout? {
         try await withCheckedThrowingContinuation { continuation in
             let sortDescriptor = NSSortDescriptor(
@@ -585,7 +632,7 @@ final class HealthKitService {
         }
     }
 
-    private func fetchHKWorkout(uuid: UUID) async throws -> HKWorkout? {
+    func fetchHKWorkout(uuid: UUID) async throws -> HKWorkout? {
         try await withCheckedThrowingContinuation { continuation in
             let predicate = HKQuery.predicateForObject(with: uuid)
             let query = HKSampleQuery(

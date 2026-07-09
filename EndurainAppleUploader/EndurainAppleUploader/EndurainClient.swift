@@ -19,7 +19,9 @@ struct UploadResult {
 enum EndurainClientError: Error, LocalizedError {
     case invalidURL
     case unauthorized
-    case serverError(Int)
+    case serverError(Int, String)
+    case rateLimited(String)
+    case duplicate(String)
     case networkError(Error)
     case unexpectedResponse
     /// Error específico de subida: incluye status code y body resumido
@@ -31,8 +33,15 @@ enum EndurainClientError: Error, LocalizedError {
             return "La URL del servidor no es válida."
         case .unauthorized:
             return "API Key no autorizada o sin scope activities:upload (401/403)."
-        case .serverError(let code):
-            return "Error del servidor: \(code)."
+        case .serverError(let code, let body):
+            let summary = body.isEmpty ? "(sin body)" : body
+            return "Error del servidor [\(code)]: \(summary)"
+        case .rateLimited(let body):
+            let summary = body.isEmpty ? "Too many requests. Please try again later." : body
+            return "Demasiadas peticiones: \(summary)"
+        case .duplicate(let body):
+            let summary = body.isEmpty ? "este entrenamiento ya existe en Endurain." : body
+            return "Duplicado: \(summary)"
         case .networkError(let error):
             return "Error de red: \(error.localizedDescription)"
         case .unexpectedResponse:
@@ -96,7 +105,7 @@ struct EndurainClient {
         case 401, 403:
             throw EndurainClientError.unauthorized
         default:
-            throw EndurainClientError.serverError(http.statusCode)
+            throw EndurainClientError.serverError(http.statusCode, "")
         }
     }
 
@@ -113,6 +122,8 @@ struct EndurainClient {
 
         let boundary = "Boundary-\(UUID().uuidString)"
         let body = buildMultipartBody(tcxData: tcxData, filename: filename, boundary: boundary)
+
+        print("[EndurainClient][Debug] POST \(url.absoluteString) filename=\(filename) tcxBytes=\(tcxData.count) multipartBytes=\(body.count)")
 
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
@@ -134,6 +145,9 @@ struct EndurainClient {
 
         let bodyString = String(data: responseData, encoding: .utf8) ?? ""
         let bodySummary = String(bodyString.prefix(500))
+        let contentType = http.value(forHTTPHeaderField: "Content-Type") ?? "nil"
+
+        print("[EndurainClient][Debug] response status=\(http.statusCode) contentType=\(contentType) body=\(bodySummary.isEmpty ? "(empty)" : bodySummary)")
 
         switch http.statusCode {
         case 200...299:
@@ -141,7 +155,11 @@ struct EndurainClient {
         case 401, 403:
             throw EndurainClientError.unauthorized
         case 409:
-            throw EndurainClientError.uploadError(409, "Duplicado: este entrenamiento ya existe en Endurain. \(bodySummary)")
+            throw EndurainClientError.duplicate(bodySummary)
+        case 429:
+            throw EndurainClientError.rateLimited(bodySummary)
+        case 500...599:
+            throw EndurainClientError.serverError(http.statusCode, bodySummary)
         default:
             throw EndurainClientError.uploadError(http.statusCode, bodySummary)
         }
