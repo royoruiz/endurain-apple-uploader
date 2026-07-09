@@ -23,9 +23,11 @@ enum HealthKitPermissionStatus {
 
 enum UploadStep: Equatable {
     case idle
-    case generatingTCX
-    case uploading
-    case savingState
+    case readingWorkout   // "Leyendo entrenamiento"
+    case readingRoute     // "Leyendo ruta"
+    case generatingTCX    // "Generando TCX"
+    case uploading        // "Subiendo a Endurain"
+    case savingState      // "Guardando estado"
     case done
 }
 
@@ -43,6 +45,10 @@ final class HealthKitService {
     var isLoading: Bool = false
     var errorMessage: String? = nil
 
+    // Query ligera: saber si hay ruta/pulso sin leer todos los puntos
+    var latestWorkoutHasRoute: Bool? = nil      // nil = no verificado aún
+    var latestWorkoutHasHeartRate: Bool? = nil  // nil = no verificado aún
+
     // MARK: - Observable state — TCX
 
     var latestWorkoutDetail: WorkoutDetail? = nil
@@ -56,7 +62,7 @@ final class HealthKitService {
     var isUploading: Bool = false
     var uploadStep: UploadStep = .idle
     var uploadErrorMessage: String? = nil
-    var uploadErrorDetail: String? = nil    // body técnico para DisclosureGroup
+    var uploadErrorDetail: String? = nil
     var lastUploadedAt: Date? = nil
 
     // MARK: - Private
@@ -89,6 +95,16 @@ final class HealthKitService {
         }
     }
 
+    // MARK: - Auto load (arranque silencioso)
+
+    /// Solo actúa si ya hay permisos disponibles y no hay workout en memoria.
+    /// No solicita permisos automáticamente — el usuario debe hacerlo explícitamente.
+    func autoLoad() async {
+        guard case .available = permissionStatus else { return }
+        guard latestWorkout == nil else { return }
+        await fetchLatestWorkout()
+    }
+
     // MARK: - Fetch Latest Workout
 
     func fetchLatestWorkout() async {
@@ -100,7 +116,9 @@ final class HealthKitService {
         isLoading = true
         errorMessage = nil
 
-        // Resetear estado TCX y subida al buscar un workout nuevo
+        // Resetear estado derivado al buscar workout nuevo
+        latestWorkoutHasRoute = nil
+        latestWorkoutHasHeartRate = nil
         tcxString = nil
         tcxFileURL = nil
         latestWorkoutDetail = nil
@@ -121,6 +139,12 @@ final class HealthKitService {
                     totalDistanceMeters: workout.totalDistance?.doubleValue(for: .meter()),
                     activeEnergyKcal: workout.totalEnergyBurned?.doubleValue(for: .kilocalorie())
                 )
+                // Query ligera: comprobar presencia de ruta y pulso
+                async let hasRoute = checkHasRoute(for: workout)
+                async let hasHR = checkHasHeartRate(for: workout)
+                let (route, hr) = await (hasRoute, hasHR)
+                latestWorkoutHasRoute = route
+                latestWorkoutHasHeartRate = hr
             } else {
                 latestHKWorkout = nil
                 latestWorkout = nil
@@ -132,7 +156,45 @@ final class HealthKitService {
         isLoading = false
     }
 
-    // MARK: - Generate TCX (standalone, para inspección)
+    // MARK: - Query ligera: ¿existe ruta?
+
+    private func checkHasRoute(for workout: HKWorkout) async -> Bool {
+        await withCheckedContinuation { continuation in
+            let predicate = HKQuery.predicateForObjects(from: workout)
+            let query = HKSampleQuery(
+                sampleType: HKSeriesType.workoutRoute(),
+                predicate: predicate,
+                limit: 1,
+                sortDescriptors: nil
+            ) { _, samples, _ in
+                continuation.resume(returning: !(samples ?? []).isEmpty)
+            }
+            store.execute(query)
+        }
+    }
+
+    // MARK: - Query ligera: ¿existe pulso?
+
+    private func checkHasHeartRate(for workout: HKWorkout) async -> Bool {
+        await withCheckedContinuation { continuation in
+            let predicate = HKQuery.predicateForSamples(
+                withStart: workout.startDate,
+                end: workout.endDate,
+                options: .strictStartDate
+            )
+            let query = HKSampleQuery(
+                sampleType: HKQuantityType(.heartRate),
+                predicate: predicate,
+                limit: 1,
+                sortDescriptors: nil
+            ) { _, samples, _ in
+                continuation.resume(returning: !(samples ?? []).isEmpty)
+            }
+            store.execute(query)
+        }
+    }
+
+    // MARK: - Generate TCX (standalone, para debug/inspección)
 
     func generateTCX() async {
         guard let workout = latestHKWorkout else {
@@ -157,8 +219,6 @@ final class HealthKitService {
 
     // MARK: - Upload workout
 
-    /// Orquesta: genera TCX → sube a Endurain → guarda en UploadStore.
-    /// Siempre regenera el TCX para garantizar consistencia con latestHKWorkout.
     func uploadWorkout(uploadStore: UploadStore, settings: SettingsStore) async {
         guard let workout = latestHKWorkout else {
             uploadErrorMessage = "Primero busca un entrenamiento."
@@ -183,34 +243,67 @@ final class HealthKitService {
         }
 
         isUploading = true
-        uploadStep = .generatingTCX
         uploadErrorMessage = nil
         uploadErrorDetail = nil
         defer { isUploading = false }
 
         do {
-            // 1. Generar TCX (siempre desde cero)
-            let detail = try await buildWorkoutDetail(for: workout)
-            let tcxString = TCXGenerator.generate(from: detail)
-            guard let tcxData = tcxString.data(using: .utf8) else {
+            // 1. Leer entrenamiento base
+            uploadStep = .readingWorkout
+            let summary = latestWorkout
+
+            // 2. Leer ruta completa
+            uploadStep = .readingRoute
+            let locations = try await fetchRoutes(for: workout)
+            let hrSamples = try await fetchHeartRateSamples(for: workout)
+
+            let points: [RoutePoint] = locations.map { loc in
+                RoutePoint(
+                    timestamp: loc.timestamp,
+                    latitude: loc.coordinate.latitude,
+                    longitude: loc.coordinate.longitude,
+                    altitude: loc.verticalAccuracy >= 0 ? loc.altitude : nil,
+                    horizontalAccuracy: loc.horizontalAccuracy >= 0 ? loc.horizontalAccuracy : nil
+                )
+            }
+
+            let detail = WorkoutDetail(
+                id: workout.uuid,
+                activityType: workout.workoutActivityType,
+                activityTypeName: workout.workoutActivityType.displayName,
+                startDate: workout.startDate,
+                endDate: workout.endDate,
+                durationSeconds: workout.duration,
+                totalDistanceMeters: workout.totalDistance?.doubleValue(for: .meter()),
+                activeEnergyKcal: workout.totalEnergyBurned?.doubleValue(for: .kilocalorie()),
+                routePoints: points,
+                heartRateSamples: hrSamples
+            )
+
+            // Actualizar estado observable del detalle
+            latestWorkoutDetail = detail
+            latestWorkoutHasRoute = detail.hasRoute
+            latestWorkoutHasHeartRate = detail.hasHeartRate
+
+            // 3. Generar TCX
+            uploadStep = .generatingTCX
+            let tcx = TCXGenerator.generate(from: detail)
+            guard let tcxData = tcx.data(using: .utf8) else {
                 uploadErrorMessage = "Error al codificar el TCX."
                 uploadStep = .idle
                 return
             }
-
-            // Actualizar estado TCX en la UI también
-            latestWorkoutDetail = detail
-            self.tcxString = tcxString
-            self.tcxFileURL = try? writeTCXToTemp(tcxString, uuid: detail.id)
+            tcxString = tcx
+            tcxFileURL = try? writeTCXToTemp(tcx, uuid: detail.id)
 
             let filename = "apple-health-\(workout.uuid.uuidString.lowercased()).tcx"
 
-            // 2. Subir a Endurain
+            // 4. Subir a Endurain
             uploadStep = .uploading
             let client = EndurainClient(serverURL: settings.serverURL, apiKey: resolvedAPIKey)
             _ = try await client.uploadActivityTCX(tcxData: tcxData, filename: filename)
 
-            // 3. Guardar en UploadStore
+            // 5. Guardar estado local
             uploadStep = .savingState
             let record = UploadRecord(
                 id: workout.uuid,
@@ -218,7 +311,10 @@ final class HealthKitService {
                 endDate: workout.endDate,
                 uploadedAt: Date(),
                 filename: filename,
-                serverURL: settings.serverURL
+                serverURL: settings.serverURL,
+                activityTypeName: summary?.activityTypeName,
+                durationSeconds: summary?.durationSeconds,
+                totalDistanceMeters: summary?.totalDistanceMeters
             )
             try uploadStore.save(record: record)
             lastUploadedAt = record.uploadedAt
@@ -227,7 +323,6 @@ final class HealthKitService {
 
         } catch let error as EndurainClientError {
             uploadErrorMessage = error.errorDescription ?? error.localizedDescription
-            // Extraer detalle técnico si es uploadError
             if case .uploadError(let code, let body) = error {
                 uploadErrorDetail = "HTTP \(code)\n\(body)"
             }
@@ -238,7 +333,7 @@ final class HealthKitService {
         }
     }
 
-    // MARK: - Build WorkoutDetail
+    // MARK: - Build WorkoutDetail (usado por generateTCX standalone)
 
     func buildWorkoutDetail(for workout: HKWorkout) async throws -> WorkoutDetail {
         async let routeLocations = fetchRoutes(for: workout)
@@ -314,14 +409,10 @@ final class HealthKitService {
                     }
                     return
                 }
-                if let locations {
-                    accumulated.append(contentsOf: locations)
-                }
-                if done {
-                    if !didResume {
-                        didResume = true
-                        continuation.resume(returning: accumulated)
-                    }
+                if let locations { accumulated.append(contentsOf: locations) }
+                if done, !didResume {
+                    didResume = true
+                    continuation.resume(returning: accumulated)
                 }
             }
             store.execute(query)

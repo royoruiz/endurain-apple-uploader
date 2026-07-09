@@ -13,10 +13,10 @@ struct StatusView: View {
     var healthKitService: HealthKitService
     var uploadStore: UploadStore
 
-    @State private var showConfirmClear: Bool = false
-    @State private var showConfirmClearHistory: Bool = false
+    @State private var showConfirmClear = false
+    @State private var showConfirmClearHistory = false
+    @State private var showUploadErrorDetail = false
     @State private var clearError: String? = nil
-    @State private var showUploadErrorDetail: Bool = false
 
     // MARK: - Body
 
@@ -26,12 +26,12 @@ struct StatusView: View {
                 serverSection
                 healthKitPermissionsSection
                 lastUploadedSection
-                uploadSection
-                tcxSection
                 latestWorkoutSection
+                syncSection
+                debugSection
                 dangerZoneSection
             }
-            .navigationTitle("Estado")
+            .navigationTitle("Endurain")
             .confirmationDialog(
                 "¿Borrar configuración?",
                 isPresented: $showConfirmClear,
@@ -71,21 +71,20 @@ struct StatusView: View {
 
     private var healthKitPermissionsSection: some View {
         Section {
-            HStack(spacing: 12) {
+            HStack(spacing: 10) {
                 Image(systemName: permissionIcon)
                     .foregroundStyle(permissionColor)
                 Text(permissionLabel)
             }
-            Button {
-                Task { await healthKitService.requestAuthorization() }
-            } label: {
-                Text("Solicitar permisos de Salud")
+            if !isPermissionButtonDisabled {
+                Button("Solicitar permisos de Salud") {
+                    Task { await healthKitService.requestAuthorization() }
+                }
             }
-            .disabled(isPermissionButtonDisabled)
         } header: {
             Text("Permisos de Apple Salud")
         } footer: {
-            Text("Puedes revisar permisos en Ajustes → Salud → Acceso a datos y dispositivos → Endurain Apple Uploader.")
+            Text("Ajustes → Salud → Acceso a datos y dispositivos → Endurain Apple Uploader.")
         }
     }
 
@@ -94,19 +93,18 @@ struct StatusView: View {
     private var lastUploadedSection: some View {
         Section("Último subido a Endurain") {
             if let last = uploadStore.lastRecord {
-                LabeledContent("Subido") {
+                LabeledContent("Fecha") {
                     Text(last.uploadedAt, format: .dateTime)
                         .foregroundStyle(.secondary)
                 }
-                LabeledContent("Fichero") {
-                    Text(last.filename)
-                        .foregroundStyle(.secondary)
-                        .font(.caption)
+                if let type = last.activityTypeName {
+                    LabeledContent("Tipo", value: type)
                 }
-                LabeledContent("Servidor") {
-                    Text(last.serverURL)
-                        .foregroundStyle(.secondary)
-                        .font(.caption)
+                if let dur = last.durationSeconds {
+                    LabeledContent("Duración", value: formattedDuration(dur))
+                }
+                if let dist = last.totalDistanceMeters {
+                    LabeledContent("Distancia", value: formattedDistance(dist))
                 }
             } else {
                 Text("Ninguno todavía")
@@ -115,35 +113,106 @@ struct StatusView: View {
         }
     }
 
-    // MARK: - Upload section
+    // MARK: - Latest workout section
 
-    private var uploadSection: some View {
-        Section {
-            let alreadyUploaded = isCurrentWorkoutUploaded
-
-            if alreadyUploaded {
-                HStack(spacing: 10) {
-                    Image(systemName: "checkmark.circle.fill")
-                        .foregroundStyle(.green)
-                    Text("Este entrenamiento ya está subido")
-                }
-                if let record = currentUploadRecord {
-                    Text("Subido el \(record.uploadedAt.formatted(.dateTime))")
-                        .font(.caption)
+    private var latestWorkoutSection: some View {
+        Section("Último entrenamiento en Apple Salud") {
+            if healthKitService.isLoading {
+                HStack {
+                    ProgressView().padding(.trailing, 6)
+                    Text("Cargando...")
                         .foregroundStyle(.secondary)
                 }
+            } else if let workout = healthKitService.latestWorkout {
+                LabeledContent("Tipo", value: workout.activityTypeName)
+                LabeledContent("Fecha") {
+                    Text(workout.startDate, format: .dateTime)
+                        .foregroundStyle(.secondary)
+                }
+                LabeledContent("Duración", value: formattedDuration(workout.durationSeconds))
+                if let dist = workout.totalDistanceMeters {
+                    LabeledContent("Distancia", value: formattedDistance(dist))
+                }
+                LabeledContent("Ruta GPS", value: routeLabel)
+                LabeledContent("Pulso", value: heartRateLabel)
+
+                if isCurrentWorkoutUploaded {
+                    HStack(spacing: 6) {
+                        Image(systemName: "checkmark.circle.fill")
+                            .foregroundStyle(.green)
+                        Text("Ya subido")
+                            .foregroundStyle(.green)
+                    }
+                    .font(.caption)
+                }
+            } else if let err = healthKitService.errorMessage {
+                Text(err)
+                    .font(.caption)
+                    .foregroundStyle(.red)
             } else {
+                Text("No se ha detectado ningún entrenamiento.")
+                    .foregroundStyle(.secondary)
+            }
+        }
+    }
+
+    // MARK: - Sync section (CTA principal)
+
+    private var syncSection: some View {
+        Section {
+            if healthKitService.isLoading {
+                // autoLoad en progreso
+                HStack {
+                    ProgressView().padding(.trailing, 6)
+                    Text("Buscando entrenamiento...")
+                        .foregroundStyle(.secondary)
+                }
+            } else if healthKitService.isUploading {
+                // Subida en progreso
+                HStack {
+                    ProgressView().padding(.trailing, 6)
+                    Text(uploadStepLabel)
+                        .foregroundStyle(.secondary)
+                }
+            } else if healthKitService.uploadStep == .done {
+                // Éxito
+                HStack(spacing: 8) {
+                    Image(systemName: "checkmark.circle.fill")
+                        .foregroundStyle(.green)
+                    Text("Entrenamiento subido correctamente")
+                        .foregroundStyle(.green)
+                        .fontWeight(.medium)
+                }
+            } else if healthKitService.latestWorkout == nil {
+                // Sin workout: botón de búsqueda manual
+                Button {
+                    Task { await healthKitService.fetchLatestWorkout() }
+                } label: {
+                    Text("Buscar entrenamiento")
+                        .frame(maxWidth: .infinity)
+                }
+                .disabled(!isHealthKitAvailable)
+            } else if isCurrentWorkoutUploaded {
+                // Todo sincronizado
+                HStack(spacing: 8) {
+                    Image(systemName: "checkmark.circle.fill")
+                        .foregroundStyle(.green)
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("Todo sincronizado")
+                            .fontWeight(.medium)
+                        Text("El último entrenamiento ya está en Endurain.")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                }
+            } else {
+                // Hay workout nuevo sin subir
                 Button {
                     showUploadErrorDetail = false
                     Task { await healthKitService.uploadWorkout(uploadStore: uploadStore, settings: store) }
                 } label: {
-                    HStack {
-                        if healthKitService.isUploading {
-                            ProgressView().padding(.trailing, 4)
-                        }
-                        Text(uploadButtonLabel)
-                    }
-                    .frame(maxWidth: .infinity)
+                    Text("Subir entrenamiento nuevo")
+                        .frame(maxWidth: .infinity)
                 }
                 .buttonStyle(.borderedProminent)
                 .disabled(uploadButtonDisabled)
@@ -166,172 +235,87 @@ struct StatusView: View {
                 }
             }
 
-            // Resultado exitoso
-            if healthKitService.uploadStep == .done {
-                HStack(spacing: 8) {
-                    Image(systemName: "checkmark.circle.fill")
-                        .foregroundStyle(.green)
-                    Text("Entrenamiento subido correctamente")
-                        .foregroundStyle(.green)
-                }
-                .font(.subheadline)
-            }
-
         } header: {
-            Text("Subir a Endurain")
+            Text("Sincronización")
         } footer: {
-            Text("Se usa la API key configurada en Ajustes.")
+            if healthKitService.latestWorkout != nil && !isCurrentWorkoutUploaded
+                && !healthKitService.isUploading && healthKitService.uploadStep != .done {
+                Text("Se usa la API key configurada en Ajustes.")
+            }
         }
     }
 
-    // MARK: - TCX section
+    // MARK: - Debug section (colapsable)
 
-    private var tcxSection: some View {
+    private var debugSection: some View {
         Section {
-            Button {
-                Task { await healthKitService.generateTCX() }
-            } label: {
-                HStack {
-                    if healthKitService.isGeneratingTCX {
-                        ProgressView().padding(.trailing, 4)
+            DisclosureGroup("Debug") {
+                Button {
+                    Task { await healthKitService.generateTCX() }
+                } label: {
+                    HStack {
+                        if healthKitService.isGeneratingTCX {
+                            ProgressView().padding(.trailing, 4)
+                        }
+                        Text(healthKitService.isGeneratingTCX
+                             ? "Generando TCX..."
+                             : "Generar TCX del último entrenamiento")
                     }
-                    Text(healthKitService.isGeneratingTCX
-                         ? "Generando TCX..."
-                         : "Generar TCX del último entrenamiento")
                 }
-            }
-            .disabled(healthKitService.latestWorkout == nil || healthKitService.isGeneratingTCX)
+                .disabled(healthKitService.latestWorkout == nil || healthKitService.isGeneratingTCX)
 
-            if let tcxError = healthKitService.tcxErrorMessage {
-                Text(tcxError)
-                    .font(.caption)
-                    .foregroundStyle(.red)
-            }
+                if let tcxError = healthKitService.tcxErrorMessage {
+                    Text(tcxError)
+                        .font(.caption)
+                        .foregroundStyle(.red)
+                }
 
-            if let detail = healthKitService.latestWorkoutDetail {
-                tcxSummary(detail)
-            }
+                if let detail = healthKitService.latestWorkoutDetail {
+                    LabeledContent("Puntos de ruta", value: "\(detail.routePoints.count)")
+                    LabeledContent("Muestras de pulso", value: "\(detail.heartRateSamples.count)")
 
-        } header: {
-            Text("TCX")
-        } footer: {
-            if healthKitService.latestWorkoutDetail == nil && healthKitService.tcxErrorMessage == nil {
-                Text("Primero busca el último entrenamiento, luego genera el TCX.")
-            }
-        }
-    }
-
-    @ViewBuilder
-    private func tcxSummary(_ detail: WorkoutDetail) -> some View {
-        LabeledContent("Puntos de ruta", value: "\(detail.routePoints.count)")
-        LabeledContent("Muestras de pulso", value: "\(detail.heartRateSamples.count)")
-
-        if let tcx = healthKitService.tcxString {
-            let kb = String(format: "%.1f KB", Double(tcx.utf8.count) / 1024.0)
-            LabeledContent("Tamaño TCX", value: kb)
-        }
-
-        LabeledContent("Contiene ruta", value: detail.hasRoute ? "Sí" : "No")
-        LabeledContent("Contiene pulso", value: detail.hasHeartRate ? "Sí" : "No")
-
-        if !detail.hasRoute {
-            Text("Este entrenamiento no tiene ruta GPS asociada o no se concedió permiso de rutas.")
-                .font(.caption)
-                .foregroundStyle(.orange)
-        }
-
-        if !detail.hasHeartRate {
-            Text("No hay muestras de frecuencia cardíaca disponibles.")
-                .font(.caption)
-                .foregroundStyle(.secondary)
-        }
-
-        if detail.hasRoute,
-           let first = detail.routePoints.first,
-           let last = detail.routePoints.last {
-            VStack(alignment: .leading, spacing: 2) {
-                Text("Primera coord: \(coordString(first)) @ \(timeString(first.timestamp))")
-                Text("Última coord:  \(coordString(last)) @ \(timeString(last.timestamp))")
-            }
-            .font(.caption2)
-            .foregroundStyle(.tertiary)
-            .textSelection(.enabled)
-        }
-
-        if let url = healthKitService.tcxFileURL {
-            ShareLink(
-                item: url,
-                preview: SharePreview(
-                    "workout_\(detail.id.uuidString.prefix(8)).tcx",
-                    image: Image(systemName: "doc.text")
-                )
-            ) {
-                Label("Compartir TCX", systemImage: "square.and.arrow.up")
-            }
-        }
-    }
-
-    // MARK: - Latest workout section
-
-    private var latestWorkoutSection: some View {
-        Section {
-            Button {
-                Task { await healthKitService.fetchLatestWorkout() }
-            } label: {
-                HStack {
-                    if healthKitService.isLoading {
-                        ProgressView().padding(.trailing, 4)
+                    if let tcx = healthKitService.tcxString {
+                        LabeledContent("Tamaño TCX",
+                            value: String(format: "%.1f KB", Double(tcx.utf8.count) / 1024.0))
                     }
-                    Text(healthKitService.isLoading ? "Buscando..." : "Buscar último entrenamiento")
+
+                    if detail.hasRoute,
+                       let first = detail.routePoints.first,
+                       let last = detail.routePoints.last {
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text("Primera: \(coordString(first)) @ \(timeString(first.timestamp))")
+                            Text("Última:  \(coordString(last)) @ \(timeString(last.timestamp))")
+                        }
+                        .font(.caption2)
+                        .foregroundStyle(.tertiary)
+                        .textSelection(.enabled)
+                    }
+
+                    if !detail.hasRoute {
+                        Text("Sin ruta GPS asociada.")
+                            .font(.caption).foregroundStyle(.orange)
+                    }
+                    if !detail.hasHeartRate {
+                        Text("Sin muestras de pulso.")
+                            .font(.caption).foregroundStyle(.secondary)
+                    }
+                }
+
+                if let url = healthKitService.tcxFileURL {
+                    ShareLink(
+                        item: url,
+                        preview: SharePreview(
+                            healthKitService.latestWorkoutDetail.map {
+                                "workout_\($0.id.uuidString.prefix(8)).tcx"
+                            } ?? "workout.tcx",
+                            image: Image(systemName: "doc.text")
+                        )
+                    ) {
+                        Label("Compartir TCX", systemImage: "square.and.arrow.up")
+                    }
                 }
             }
-            .disabled(healthKitService.isLoading || !isHealthKitAvailable)
-
-            if let errorMsg = healthKitService.errorMessage {
-                Text(errorMsg)
-                    .font(.caption)
-                    .foregroundStyle(.red)
-            }
-
-            if !healthKitService.isLoading {
-                if let workout = healthKitService.latestWorkout {
-                    workoutDetails(workout)
-                } else if healthKitService.errorMessage == nil {
-                    Text("No se ha detectado ningún entrenamiento. Puede ser porque no hay entrenos recientes o porque los permisos de Salud no están concedidos.")
-                        .font(.subheadline)
-                        .foregroundStyle(.secondary)
-                }
-            }
-
-        } header: {
-            Text("Último entrenamiento en Apple Salud")
-        } footer: {
-            if healthKitService.latestWorkout == nil && healthKitService.errorMessage == nil {
-                Text("Puedes revisar permisos en Ajustes → Salud → Acceso a datos y dispositivos → Endurain Apple Uploader.")
-            }
         }
-    }
-
-    @ViewBuilder
-    private func workoutDetails(_ w: WorkoutSummary) -> some View {
-        LabeledContent("Tipo", value: w.activityTypeName)
-        LabeledContent("Inicio") {
-            Text(w.startDate, format: .dateTime).foregroundStyle(.secondary)
-        }
-        LabeledContent("Fin") {
-            Text(w.endDate, format: .dateTime).foregroundStyle(.secondary)
-        }
-        LabeledContent("Duración", value: formattedDuration(w.durationSeconds))
-        if let distanceM = w.totalDistanceMeters {
-            LabeledContent("Distancia", value: formattedDistance(distanceM))
-        }
-        if let kcal = w.activeEnergyKcal {
-            LabeledContent("Calorías activas", value: String(format: "%.0f kcal", kcal))
-        }
-        Text(w.id.uuidString)
-            .font(.caption2)
-            .foregroundStyle(.tertiary)
-            .textSelection(.enabled)
     }
 
     // MARK: - Danger zone section
@@ -359,6 +343,7 @@ struct StatusView: View {
                     .frame(maxWidth: .infinity)
             }
             .buttonStyle(.bordered)
+
         } header: {
             Text("Zona de peligro")
         } footer: {
@@ -373,11 +358,6 @@ struct StatusView: View {
         return uploadStore.isUploaded(workoutUUID: id)
     }
 
-    private var currentUploadRecord: UploadRecord? {
-        guard let id = healthKitService.latestWorkout?.id else { return nil }
-        return uploadStore.record(for: id)
-    }
-
     private var uploadButtonDisabled: Bool {
         healthKitService.latestWorkout == nil
             || healthKitService.isUploading
@@ -385,13 +365,33 @@ struct StatusView: View {
             || isCurrentWorkoutUploaded
     }
 
-    private var uploadButtonLabel: String {
+    private var uploadStepLabel: String {
         switch healthKitService.uploadStep {
-        case .generatingTCX: return "Generando TCX..."
-        case .uploading:     return "Subiendo a Endurain..."
-        case .savingState:   return "Guardando estado..."
-        case .done:          return "¡Subido!"
-        case .idle:          return "Subir entrenamiento a Endurain"
+        case .readingWorkout: return "Leyendo entrenamiento..."
+        case .readingRoute:   return "Leyendo ruta..."
+        case .generatingTCX:  return "Generando TCX..."
+        case .uploading:      return "Subiendo a Endurain..."
+        case .savingState:    return "Guardando estado..."
+        case .done:           return "¡Subido!"
+        case .idle:           return "Subiendo..."
+        }
+    }
+
+    // MARK: - Route / HR labels (query ligera)
+
+    private var routeLabel: String {
+        switch healthKitService.latestWorkoutHasRoute {
+        case .none:  return "—"
+        case true:   return "Sí"
+        case false:  return "No"
+        }
+    }
+
+    private var heartRateLabel: String {
+        switch healthKitService.latestWorkoutHasHeartRate {
+        case .none:  return "—"
+        case true:   return "Sí"
+        case false:  return "No"
         }
     }
 
@@ -404,6 +404,7 @@ struct StatusView: View {
 
     private var isPermissionButtonDisabled: Bool {
         if case .unavailable = healthKitService.permissionStatus { return true }
+        if case .available   = healthKitService.permissionStatus { return true }
         return false
     }
 

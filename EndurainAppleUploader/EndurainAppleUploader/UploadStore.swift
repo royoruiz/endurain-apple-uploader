@@ -11,12 +11,16 @@ import Observation
 // MARK: - UploadRecord
 
 struct UploadRecord: Codable, Identifiable {
-    let id: UUID          // workoutUUID — mismo que HKWorkout.uuid
+    let id: UUID                            // workoutUUID — mismo que HKWorkout.uuid
     let startDate: Date
     let endDate: Date
     let uploadedAt: Date
     let filename: String
     let serverURL: String
+    // Campos opcionales añadidos en Fase 5 — nil en registros previos
+    let activityTypeName: String?
+    let durationSeconds: TimeInterval?
+    let totalDistanceMeters: Double?
 }
 
 // MARK: - UploadStore
@@ -57,7 +61,6 @@ final class UploadStore {
     // MARK: - Save
 
     func save(record: UploadRecord) throws {
-        // Evitar duplicados: si ya existe el UUID, no añadir
         guard !records.contains(where: { $0.id == record.id }) else { return }
         records.append(record)
         try persist()

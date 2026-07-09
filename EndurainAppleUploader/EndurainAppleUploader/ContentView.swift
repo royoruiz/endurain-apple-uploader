@@ -16,6 +16,11 @@ struct ContentView: View {
     var body: some View {
         if store.isConfigured {
             StatusView(store: store, healthKitService: healthKitService, uploadStore: uploadStore)
+                .task {
+                    // Arranque silencioso: solo si los permisos ya fueron concedidos.
+                    // No solicita permisos automáticamente — acción consciente del usuario.
+                    await healthKitService.autoLoad()
+                }
         } else {
             SettingsView(store: store)
         }
