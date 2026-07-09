@@ -10,10 +10,11 @@ import SwiftUI
 struct ContentView: View {
 
     var store: SettingsStore
+    var healthKitService: HealthKitService
 
     var body: some View {
         if store.isConfigured {
-            StatusView(store: store)
+            StatusView(store: store, healthKitService: healthKitService)
         } else {
             SettingsView(store: store)
         }
@@ -21,5 +22,5 @@ struct ContentView: View {
 }
 
 #Preview {
-    ContentView(store: SettingsStore())
+    ContentView(store: SettingsStore(), healthKitService: HealthKitService())
 }

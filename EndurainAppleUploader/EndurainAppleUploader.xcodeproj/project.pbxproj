@@ -257,6 +257,7 @@
 				DEVELOPMENT_TEAM = 9TL687WVWT;
 				ENABLE_PREVIEWS = YES;
 				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_KEY_NSHealthShareUsageDescription = "Esta app lee tus entrenamientos, rutas, distancia, calorías y frecuencia cardíaca de Apple Salud para subirlos a tu servidor Endurain.";
 				INFOPLIST_KEY_NSHealthUpdateUsageDescription = "Esta app no modifica tus datos de Apple Salud.";
 				INFOPLIST_KEY_UIApplicationSceneManifest_Generation = YES;
 				INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents = YES;
@@ -291,6 +292,7 @@
 				DEVELOPMENT_TEAM = 9TL687WVWT;
 				ENABLE_PREVIEWS = YES;
 				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_KEY_NSHealthShareUsageDescription = "Esta app lee tus entrenamientos, rutas, distancia, calorías y frecuencia cardíaca de Apple Salud para subirlos a tu servidor Endurain.";
 				INFOPLIST_KEY_NSHealthUpdateUsageDescription = "Esta app no modifica tus datos de Apple Salud.";
 				INFOPLIST_KEY_UIApplicationSceneManifest_Generation = YES;
 				INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents = YES;

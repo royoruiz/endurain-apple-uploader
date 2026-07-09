@@ -11,10 +11,11 @@ import SwiftUI
 struct EndurainAppleUploaderApp: App {
 
     @State private var settingsStore = SettingsStore()
+    @State private var healthKitService = HealthKitService()
 
     var body: some Scene {
         WindowGroup {
-            ContentView(store: settingsStore)
+            ContentView(store: settingsStore, healthKitService: healthKitService)
         }
     }
 }
