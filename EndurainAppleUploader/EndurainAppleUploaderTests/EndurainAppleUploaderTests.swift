@@ -641,83 +641,74 @@ final class UploadStatusMapperTests: XCTestCase {
     }
 }
 
-final class EndurainActivityLookupTests: XCTestCase {
-    func testExtractActivitiesFindsNestedActivityObjects() throws {
-        let object: [String: Any] = [
-            "items": [
-                [
-                    "id": 1,
-                    "start_time": "2026-07-10T10:00:00Z",
-                    "total_timer_time": 3600,
-                    "distance": 10_000
-                ]
-            ]
-        ]
-
-        let activities = EndurainClient.extractActivities(from: object)
-
-        XCTAssertEqual(activities.count, 1)
-        XCTAssertEqual(activities.first?.durationSeconds, 3600)
-        XCTAssertEqual(activities.first?.distanceMeters, 10_000)
+final class EndurainClientTests: XCTestCase {
+    override func tearDown() {
+        MockURLProtocol.handler = nil
+        super.tearDown()
     }
 
-    func testEquivalentServerActivityMatchesLocalWorkout() throws {
-        let start = Date(timeIntervalSince1970: 1_800_000_000)
-        let item = SyncQueueItem(
-            workoutUUID: "workout",
-            startDate: start,
-            endDate: start.addingTimeInterval(3600),
-            activityTypeName: "Carrera",
-            distanceMeters: 10_000,
-            durationSeconds: 3600,
-            status: .queued,
-            tcxFilePath: nil,
-            retryCount: 0,
-            lastError: nil,
-            uploadedAt: nil,
-            serverURL: "https://example.com",
-            fileHash: nil,
-            backgroundTaskIdentifier: nil,
-            multipartFilePath: nil,
-            uploadStartedAt: nil,
-            createdAt: start
-        )
-        let activity = EndurainServerActivity(
-            startDate: start.addingTimeInterval(45),
-            durationSeconds: 3610,
-            distanceMeters: 10_050
-        )
+    func testConnectionCallsOnlyBaseURLWithoutAPIKey() async throws {
+        let session = makeMockSession()
+        MockURLProtocol.handler = { request in
+            XCTAssertEqual(request.url?.absoluteString, "https://example.com")
+            XCTAssertEqual(request.httpMethod, "HEAD")
+            XCTAssertNil(request.value(forHTTPHeaderField: "X-API-Key"))
+            XCTAssertNil(request.value(forHTTPHeaderField: "Authorization"))
+            return (HTTPURLResponse(url: try XCTUnwrap(request.url), statusCode: 404, httpVersion: nil, headerFields: nil)!, Data())
+        }
 
-        XCTAssertTrue(EndurainClient.isEquivalent(activity, to: item))
+        let client = EndurainClient(serverURL: "https://example.com", apiKey: "secret", session: session)
+
+        let isReachable = try await client.testConnection()
+        XCTAssertTrue(isReachable)
     }
 
-    func testDifferentServerActivityDoesNotMatchLocalWorkout() throws {
-        let start = Date(timeIntervalSince1970: 1_800_000_000)
-        let item = SyncQueueItem(
-            workoutUUID: "workout",
-            startDate: start,
-            endDate: start.addingTimeInterval(3600),
-            activityTypeName: "Carrera",
-            distanceMeters: 10_000,
-            durationSeconds: 3600,
-            status: .queued,
-            tcxFilePath: nil,
-            retryCount: 0,
-            lastError: nil,
-            uploadedAt: nil,
-            serverURL: "https://example.com",
-            fileHash: nil,
-            backgroundTaskIdentifier: nil,
-            multipartFilePath: nil,
-            uploadStartedAt: nil,
-            createdAt: start
-        )
-        let activity = EndurainServerActivity(
-            startDate: start.addingTimeInterval(30 * 60),
-            durationSeconds: 3600,
-            distanceMeters: 10_000
-        )
+    func testUploadUsesXAPIKeyOnly() async throws {
+        let session = makeMockSession()
+        MockURLProtocol.handler = { request in
+            XCTAssertEqual(request.url?.absoluteString, "https://example.com/api/v1/activities/create/upload")
+            XCTAssertEqual(request.httpMethod, "POST")
+            XCTAssertEqual(request.value(forHTTPHeaderField: "X-API-Key"), "secret")
+            XCTAssertNil(request.value(forHTTPHeaderField: "Authorization"))
+            XCTAssertFalse(request.url?.absoluteString.contains("secret") ?? true)
+            return (HTTPURLResponse(url: try XCTUnwrap(request.url), statusCode: 201, httpVersion: nil, headerFields: nil)!, Data("ok".utf8))
+        }
 
-        XCTAssertFalse(EndurainClient.isEquivalent(activity, to: item))
+        let client = EndurainClient(serverURL: "https://example.com", apiKey: "secret", session: session)
+        let result = try await client.uploadActivityTCX(tcxData: Data("tcx".utf8), filename: "activity.tcx")
+
+        XCTAssertEqual(result.statusCode, 201)
     }
+
+    private func makeMockSession() -> URLSession {
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [MockURLProtocol.self]
+        return URLSession(configuration: configuration)
+    }
+}
+
+private final class MockURLProtocol: URLProtocol {
+    static var handler: ((URLRequest) throws -> (HTTPURLResponse, Data))?
+
+    override class func canInit(with request: URLRequest) -> Bool { true }
+
+    override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
+
+    override func startLoading() {
+        guard let handler = Self.handler else {
+            client?.urlProtocol(self, didFailWithError: URLError(.badServerResponse))
+            return
+        }
+
+        do {
+            let (response, data) = try handler(request)
+            client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
+            client?.urlProtocol(self, didLoad: data)
+            client?.urlProtocolDidFinishLoading(self)
+        } catch {
+            client?.urlProtocol(self, didFailWithError: error)
+        }
+    }
+
+    override func stopLoading() {}
 }

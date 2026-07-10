@@ -23,6 +23,7 @@ App iOS que lee entrenamientos de Apple Salud y los sube a una instancia self-ho
 - **Escaneo completo**: al abrir la app, escanea todos los entrenamientos de Apple Salud desde el año 2000.
 - **Cola persistente**: guarda el estado en `Application Support/EndurainAppleUploader/sync-queue.json`.
 - **Deduplicación**: nunca sube dos veces el mismo entrenamiento para el mismo servidor+usuario (clave: `SHA256(servidor_normalizado + "\n" + usuario_normalizado) + HKWorkout.uuid`).
+- **Sin lectura de Endurain**: las API keys de esta app solo necesitan `activities:upload`. La app no lee perfil ni lista de actividades del servidor.
 - **Generación TCX**: lee ruta GPS y frecuencia cardíaca, genera un fichero TCX estándar (Garmin Training Center XML).
 - **Omisión segura**: los entrenamientos sin al menos dos puntos GPS se marcan como omitidos. Endurain no importa correctamente TCX sin trackpoints.
 - **Subida en background**: usa `URLSessionConfiguration.background` y `uploadTask(fromFile:)`. El multipart completo se escribe a disco antes de programar la tarea.
@@ -61,6 +62,7 @@ App iOS que lee entrenamientos de Apple Salud y los sube a una instancia self-ho
 - Entitlement `com.apple.developer.healthkit.background-delivery` debe estar presente.
 - No se usa `BGTaskScheduler` en esta fase.
 - No hace falta guardar la API key fuera de Keychain. La API key es credencial, no identidad, y no participa en la deduplicación.
+- La comprobación de servidor, si se ejecuta, solo verifica conectividad básica contra la URL base y no valida la API key.
 
 ## Cómo Probar
 
@@ -90,6 +92,14 @@ App iOS que lee entrenamientos de Apple Salud y los sube a una instancia self-ho
 8. Con esa casilla marcada, la app borra solo el historial de ese namespace y podrá volver a subir los entrenamientos al reconfigurar el mismo servidor+usuario.
 9. Cambiar de servidor o cambiar de usuario crea otro namespace, así que los mismos entrenamientos son elegibles para ese destino.
 10. Los permisos de HealthKit deben seguir concedidos salvo que se revoquen desde Ajustes de iOS.
+
+### API keys y duplicados
+
+- Endurain API keys para esta app solo requieren `activities:upload`.
+- La app no usa `profile:read`, `activities:read`, `/api/v1/user/me`, `/api/v1/profile` ni endpoints de listado de actividades.
+- La prevención de duplicados es local y está acotada por servidor normalizado + usuario normalizado + `HKWorkout.uuid`.
+- Si solo rotas la API key para el mismo servidor y usuario, no borres el historial de subidas.
+- Si recreas o vacías la base de datos de Endurain manteniendo el mismo servidor y usuario, la app no puede detectarlo desde la API. Para subir todo otra vez, borra la configuración marcando **Also delete upload history for this server/user**.
 
 ---
 

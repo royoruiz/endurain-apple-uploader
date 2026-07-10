@@ -170,7 +170,7 @@ final class BackgroundUploadService: NSObject, @preconcurrency URLSessionTaskDel
             deleteTCXIfPresent(item)
             AppLog.upload.info("Background upload task \(taskID) completed with status \(statusCode)")
         case .failure(.unauthorized):
-            queue.markFailed(namespaceID: namespaceID, uuid: item.workoutUUID, error: "API key no autorizada o sin scope activities:upload")
+            queue.markFailed(namespaceID: namespaceID, uuid: item.workoutUUID, error: "API key is not authorized for activity upload or is invalid")
         case .failure(.duplicate):
             queue.markSkipped(namespaceID: namespaceID, uuid: item.workoutUUID, reason: "skippedExistingServerActivity")
             deleteTCXIfPresent(item)

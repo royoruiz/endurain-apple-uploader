@@ -122,7 +122,7 @@ struct SettingsView: View {
                 } header: {
                     Text("API Key")
                 } footer: {
-                    Text("Se guarda de forma segura en el Keychain de iOS.")
+                    Text("API key will be used when uploading activities. Se guarda de forma segura en el Keychain de iOS.")
                 }
 
                 // MARK: Guardar
@@ -171,7 +171,7 @@ struct SettingsView: View {
             return
         }
 
-        // Comprobar servidor antes de guardar
+        // Comprobar conectividad básica antes de guardar. No valida la API key.
         let client = EndurainClient(serverURL: normalizedURL, apiKey: trimmedKey)
         do {
             _ = try await client.testConnection()

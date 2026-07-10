@@ -81,7 +81,6 @@ final class SyncEngine {
     private let queue: SyncQueueStore
     private let settings: SettingsStore
     private let backgroundUploadService: BackgroundUploadService
-    private let makeActivityLookup: (String, String) -> EndurainActivityLookup
 
     private var isSyncInProgress = false
     private var automaticContinuationTask: Task<Void, Never>?
@@ -98,14 +97,12 @@ final class SyncEngine {
         hkService: HealthKitService,
         queue: SyncQueueStore,
         settings: SettingsStore,
-        backgroundUploadService: BackgroundUploadService,
-        makeActivityLookup: @escaping (String, String) -> EndurainActivityLookup = { EndurainClient(serverURL: $0, apiKey: $1) }
+        backgroundUploadService: BackgroundUploadService
     ) {
         self.hkService = hkService
         self.queue = queue
         self.settings = settings
         self.backgroundUploadService = backgroundUploadService
-        self.makeActivityLookup = makeActivityLookup
         self.backgroundUploadService.onQueueChanged = { [weak self] in
             self?.refreshCounts()
             self?.refreshIdleStateAfterBackgroundEvent()
@@ -285,35 +282,6 @@ final class SyncEngine {
                     continue
                 }
 
-                let activityLookup = makeActivityLookup(identity.normalizedServerURL, resolvedAPIKey)
-                do {
-                    if try await activityLookup.containsEquivalentActivity(to: currentItem) {
-                        queue.markSkipped(
-                            namespaceID: identity.namespaceID,
-                            uuid: item.workoutUUID,
-                            reason: "skippedExistingServerActivity"
-                        )
-                        refreshCounts()
-                        continue
-                    }
-                } catch EndurainClientError.unauthorizedActivityLookup {
-                    let msg = "La API key necesita permisos de lectura (profile y activities:read) además de activities:upload para evitar duplicados."
-                    AppLog.sync.error("Server duplicate lookup unauthorized")
-                    queue.requeue(namespaceID: identity.namespaceID, uuid: item.workoutUUID, error: msg)
-                    syncState = .error(msg)
-                    lastError = msg
-                    refreshCounts()
-                    return
-                } catch {
-                    let msg = "No se pudo comprobar si la actividad ya existe en Endurain. Se detiene para evitar duplicados."
-                    AppLog.sync.error("Server duplicate lookup failed: \(error.localizedDescription, privacy: .private)")
-                    queue.requeue(namespaceID: identity.namespaceID, uuid: item.workoutUUID, error: msg)
-                    syncState = .error(msg)
-                    lastError = msg
-                    refreshCounts()
-                    return
-                }
-
                 let namespaceTCXDirectoryURL = queue.tcxQueueDirectoryURL
                     .appendingPathComponent(identity.namespaceID, isDirectory: true)
                 try FileManager.default.createDirectory(at: namespaceTCXDirectoryURL, withIntermediateDirectories: true)
@@ -420,7 +388,7 @@ final class SyncEngine {
                 // Para 401/403 (API key inválida) — detener la cola, no tiene sentido continuar
                 if case .unauthorized = error {
                     queue.requeue(namespaceID: identity.namespaceID, uuid: item.workoutUUID, error: msg)
-                    let authMsg = "API key no autorizada. Revisa la configuración."
+                    let authMsg = "API key is not authorized for activity upload or is invalid."
                     syncState = .error(authMsg)
                     lastError = authMsg
                     return
