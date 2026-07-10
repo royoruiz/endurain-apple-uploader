@@ -18,8 +18,8 @@ final class SettingsStore {
 
     // MARK: - Private
 
-    private let defaults = UserDefaults.standard
-    private let keychain = KeychainService()
+    private let defaults: UserDefaults
+    private let keychain: KeychainService
 
     private enum Keys {
         static let serverURL = "endurain_server_url"
@@ -27,7 +27,9 @@ final class SettingsStore {
 
     // MARK: - Init
 
-    init() {
+    init(defaults: UserDefaults = .standard, keychain: KeychainService = KeychainService()) {
+        self.defaults = defaults
+        self.keychain = keychain
         load()
     }
 
@@ -42,9 +44,10 @@ final class SettingsStore {
     // MARK: - Save
 
     func save(serverURL: String, apiKey: String) throws {
-        defaults.set(serverURL, forKey: Keys.serverURL)
+        let normalizedURL = try ServerURLNormalizer.normalize(serverURL)
+        defaults.set(normalizedURL, forKey: Keys.serverURL)
         try keychain.save(apiKey)
-        self.serverURL = serverURL
+        self.serverURL = normalizedURL
         self.isConfigured = true
     }
 

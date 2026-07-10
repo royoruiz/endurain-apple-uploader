@@ -10,10 +10,11 @@
 //
 
 import Foundation
+import os
 
 // MARK: - SyncStatus
 
-enum SyncStatus: String, Codable {
+enum SyncStatus: String, Codable, Equatable {
     case discovered     // detectado, aún no evaluado
     case queued         // listo para generar TCX y subir
     case generating     // generando TCX en este momento
@@ -81,14 +82,20 @@ final class SyncQueueStore {
 
     // MARK: - Init
 
-    init() throws {
-        let appSupport = try FileManager.default.url(
-            for: .applicationSupportDirectory,
-            in: .userDomainMask,
-            appropriateFor: nil,
-            create: true
-        )
-        let subdir = appSupport.appendingPathComponent(Self.appSupportSubdir, isDirectory: true)
+    init(baseDirectoryURL: URL? = nil) throws {
+        let baseDirectory: URL
+        if let baseDirectoryURL {
+            baseDirectory = baseDirectoryURL
+        } else {
+            baseDirectory = try FileManager.default.url(
+                for: .applicationSupportDirectory,
+                in: .userDomainMask,
+                appropriateFor: nil,
+                create: true
+            )
+        }
+
+        let subdir = baseDirectory.appendingPathComponent(Self.appSupportSubdir, isDirectory: true)
         try FileManager.default.createDirectory(at: subdir, withIntermediateDirectories: true)
 
         queueFileURL = subdir.appendingPathComponent(Self.queueFilename)
@@ -111,7 +118,7 @@ final class SyncQueueStore {
             let data = try Data(contentsOf: queueFileURL)
             items = try decoder.decode([SyncQueueItem].self, from: data)
         } catch {
-            print("[SyncQueueStore] Error al cargar cola: \(error). Empezando con cola vacía.")
+            AppLog.queue.error("Failed to load sync queue: \(error.localizedDescription, privacy: .private)")
             items = []
         }
     }
@@ -131,7 +138,7 @@ final class SyncQueueStore {
                 try FileManager.default.moveItem(at: tempURL, to: queueFileURL)
             }
         } catch {
-            print("[SyncQueueStore] Error al guardar cola: \(error)")
+            AppLog.queue.error("Failed to save sync queue: \(error.localizedDescription, privacy: .private)")
         }
     }
 

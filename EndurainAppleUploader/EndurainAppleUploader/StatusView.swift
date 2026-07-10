@@ -6,6 +6,7 @@
 //
 
 import SwiftUI
+import os
 
 struct StatusView: View {
 
@@ -274,7 +275,7 @@ struct StatusView: View {
         do {
             try store.clear()
         } catch {
-            print("[StatusView] Error al borrar configuración: \(error)")
+            AppLog.settings.error("Failed to clear settings: \(error.localizedDescription, privacy: .private)")
         }
     }
 }

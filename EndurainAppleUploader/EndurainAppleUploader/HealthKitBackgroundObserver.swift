@@ -7,6 +7,7 @@
 
 import Foundation
 import HealthKit
+import os
 
 final class HealthKitBackgroundObserver {
 
@@ -25,7 +26,7 @@ final class HealthKitBackgroundObserver {
         if observerQuery == nil {
             let query = HKObserverQuery(sampleType: workoutType, predicate: nil) { [weak self] _, completionHandler, error in
                 if let error {
-                    print("[HealthKitBackgroundObserver] Observer error: \(error.localizedDescription)")
+                    AppLog.healthKit.error("HealthKit observer failed: \(error.localizedDescription, privacy: .private)")
                     completionHandler()
                     return
                 }
@@ -41,9 +42,9 @@ final class HealthKitBackgroundObserver {
 
         store.enableBackgroundDelivery(for: workoutType, frequency: .immediate) { success, error in
             if let error {
-                print("[HealthKitBackgroundObserver] Background delivery error: \(error.localizedDescription)")
-            } else {
-                print("[HealthKitBackgroundObserver] Background delivery enabled: \(success)")
+                AppLog.healthKit.error("HealthKit background delivery failed: \(error.localizedDescription, privacy: .private)")
+            } else if success {
+                AppLog.healthKit.info("HealthKit background delivery enabled")
             }
         }
     }
@@ -62,7 +63,7 @@ final class HealthKitBackgroundObserver {
                 limit: HKObjectQueryNoLimit
             ) { [weak self] _, _, _, newAnchor, error in
                 if let error {
-                    print("[HealthKitBackgroundObserver] Anchored query error: \(error.localizedDescription)")
+                    AppLog.healthKit.error("HealthKit anchored query failed: \(error.localizedDescription, privacy: .private)")
                 }
                 if let newAnchor {
                     self?.saveAnchor(newAnchor)

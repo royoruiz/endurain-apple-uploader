@@ -8,6 +8,7 @@
 
 /* Begin PBXFileReference section */
 		B761965E2FFFE087001E90FA /* EndurainAppleUploader.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = EndurainAppleUploader.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		B761967E2FFFE999001E90FA /* EndurainAppleUploaderTests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = EndurainAppleUploaderTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
 /* End PBXFileReference section */
 
 /* Begin PBXFileSystemSynchronizedRootGroup section */
@@ -16,10 +17,22 @@
 			path = EndurainAppleUploader;
 			sourceTree = "<group>";
 		};
+		B761967F2FFFE999001E90FA /* EndurainAppleUploaderTests */ = {
+			isa = PBXFileSystemSynchronizedRootGroup;
+			path = EndurainAppleUploaderTests;
+			sourceTree = "<group>";
+		};
 /* End PBXFileSystemSynchronizedRootGroup section */
 
 /* Begin PBXFrameworksBuildPhase section */
 		B761965B2FFFE087001E90FA /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		B761967B2FFFE999001E90FA /* Frameworks */ = {
 			isa = PBXFrameworksBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
@@ -33,6 +46,7 @@
 			isa = PBXGroup;
 			children = (
 				B76196602FFFE087001E90FA /* EndurainAppleUploader */,
+				B761967F2FFFE999001E90FA /* EndurainAppleUploaderTests */,
 				B761965F2FFFE087001E90FA /* Products */,
 			);
 			sourceTree = "<group>";
@@ -41,6 +55,7 @@
 			isa = PBXGroup;
 			children = (
 				B761965E2FFFE087001E90FA /* EndurainAppleUploader.app */,
+				B761967E2FFFE999001E90FA /* EndurainAppleUploaderTests.xctest */,
 			);
 			name = Products;
 			sourceTree = "<group>";
@@ -70,7 +85,40 @@
 			productReference = B761965E2FFFE087001E90FA /* EndurainAppleUploader.app */;
 			productType = "com.apple.product-type.application";
 		};
+		B761967D2FFFE999001E90FA /* EndurainAppleUploaderTests */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = B761968B2FFFE999001E90FA /* Build configuration list for PBXNativeTarget "EndurainAppleUploaderTests" */;
+			buildPhases = (
+				B761967A2FFFE999001E90FA /* Sources */,
+				B761967B2FFFE999001E90FA /* Frameworks */,
+				B761967C2FFFE999001E90FA /* Resources */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+				B76196822FFFE999001E90FA /* PBXTargetDependency */,
+			);
+			fileSystemSynchronizedGroups = (
+				B761967F2FFFE999001E90FA /* EndurainAppleUploaderTests */,
+			);
+			name = EndurainAppleUploaderTests;
+			packageProductDependencies = (
+			);
+			productName = EndurainAppleUploaderTests;
+			productReference = B761967E2FFFE999001E90FA /* EndurainAppleUploaderTests.xctest */;
+			productType = "com.apple.product-type.bundle.unit-test";
+		};
 /* End PBXNativeTarget section */
+
+/* Begin PBXContainerItemProxy section */
+		B76196812FFFE999001E90FA /* PBXContainerItemProxy */ = {
+			isa = PBXContainerItemProxy;
+			containerPortal = B76196562FFFE087001E90FA /* Project object */;
+			proxyType = 1;
+			remoteGlobalIDString = B761965D2FFFE087001E90FA;
+			remoteInfo = EndurainAppleUploader;
+		};
+/* End PBXContainerItemProxy section */
 
 /* Begin PBXProject section */
 		B76196562FFFE087001E90FA /* Project object */ = {
@@ -82,6 +130,10 @@
 				TargetAttributes = {
 					B761965D2FFFE087001E90FA = {
 						CreatedOnToolsVersion = 26.6;
+					};
+					B761967D2FFFE999001E90FA = {
+						CreatedOnToolsVersion = 26.6;
+						TestTargetID = B761965D2FFFE087001E90FA;
 					};
 				};
 			};
@@ -100,12 +152,20 @@
 			projectRoot = "";
 			targets = (
 				B761965D2FFFE087001E90FA /* EndurainAppleUploader */,
+				B761967D2FFFE999001E90FA /* EndurainAppleUploaderTests */,
 			);
 		};
 /* End PBXProject section */
 
 /* Begin PBXResourcesBuildPhase section */
 		B761965C2FFFE087001E90FA /* Resources */ = {
+			isa = PBXResourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		B761967C2FFFE999001E90FA /* Resources */ = {
 			isa = PBXResourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
@@ -122,7 +182,22 @@
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
+		B761967A2FFFE999001E90FA /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
 /* End PBXSourcesBuildPhase section */
+
+/* Begin PBXTargetDependency section */
+		B76196822FFFE999001E90FA /* PBXTargetDependency */ = {
+			isa = PBXTargetDependency;
+			target = B761965D2FFFE087001E90FA /* EndurainAppleUploader */;
+			targetProxy = B76196812FFFE999001E90FA /* PBXContainerItemProxy */;
+		};
+/* End PBXTargetDependency section */
 
 /* Begin XCBuildConfiguration section */
 		B76196692FFFE088001E90FA /* Debug */ = {
@@ -316,6 +391,44 @@
 			};
 			name = Release;
 		};
+		B761968C2FFFE999001E90FA /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				BUNDLE_LOADER = "$(TEST_HOST)";
+				CODE_SIGN_STYLE = Automatic;
+				DEVELOPMENT_TEAM = 9TL687WVWT;
+				GENERATE_INFOPLIST_FILE = YES;
+				IPHONEOS_DEPLOYMENT_TARGET = 26.5;
+				MARKETING_VERSION = 1.0;
+				PRODUCT_BUNDLE_IDENTIFIER = es.overtus.EndurainUploaderiOSTests;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SWIFT_APPROACHABLE_CONCURRENCY = YES;
+				SWIFT_DEFAULT_ACTOR_ISOLATION = MainActor;
+				SWIFT_VERSION = 5.0;
+				TARGETED_DEVICE_FAMILY = "1,2";
+				TEST_HOST = "$(BUILT_PRODUCTS_DIR)/EndurainAppleUploader.app/$(BUNDLE_EXECUTABLE_FOLDER_PATH)/EndurainAppleUploader";
+			};
+			name = Debug;
+		};
+		B761968D2FFFE999001E90FA /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				BUNDLE_LOADER = "$(TEST_HOST)";
+				CODE_SIGN_STYLE = Automatic;
+				DEVELOPMENT_TEAM = 9TL687WVWT;
+				GENERATE_INFOPLIST_FILE = YES;
+				IPHONEOS_DEPLOYMENT_TARGET = 26.5;
+				MARKETING_VERSION = 1.0;
+				PRODUCT_BUNDLE_IDENTIFIER = es.overtus.EndurainUploaderiOSTests;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SWIFT_APPROACHABLE_CONCURRENCY = YES;
+				SWIFT_DEFAULT_ACTOR_ISOLATION = MainActor;
+				SWIFT_VERSION = 5.0;
+				TARGETED_DEVICE_FAMILY = "1,2";
+				TEST_HOST = "$(BUILT_PRODUCTS_DIR)/EndurainAppleUploader.app/$(BUNDLE_EXECUTABLE_FOLDER_PATH)/EndurainAppleUploader";
+			};
+			name = Release;
+		};
 /* End XCBuildConfiguration section */
 
 /* Begin XCConfigurationList section */
@@ -333,6 +446,15 @@
 			buildConfigurations = (
 				B761966C2FFFE088001E90FA /* Debug */,
 				B761966D2FFFE088001E90FA /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+		B761968B2FFFE999001E90FA /* Build configuration list for PBXNativeTarget "EndurainAppleUploaderTests" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				B761968C2FFFE999001E90FA /* Debug */,
+				B761968D2FFFE999001E90FA /* Release */,
 			);
 			defaultConfigurationIsVisible = 0;
 			defaultConfigurationName = Release;

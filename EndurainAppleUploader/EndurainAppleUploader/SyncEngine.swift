@@ -22,6 +22,7 @@
 import Foundation
 import HealthKit
 import Observation
+import os
 
 // MARK: - EngineSyncState
 
@@ -86,7 +87,6 @@ final class SyncEngine {
     private let maxUploadsPerBatch = 10
     private let maxQueueItemsPerRun = 100
     private let uploadDelayNanoseconds: UInt64 = 2_000_000_000
-    private let tcxLogPreviewLimit = 1_500
     private let minimumRoutePoints = 20
     private let minimumRouteDurationSeconds: TimeInterval = 60
     private let minimumRouteCoverageRatio = 0.50
@@ -113,7 +113,7 @@ final class SyncEngine {
         queue.resetInFlightItems()
         let cleaned = queue.cleanupInvalidReadyToUploadTCX()
         if cleaned > 0 {
-            print("[SyncEngine] Cleaned \(cleaned) invalid TCX files from the persistent queue.")
+            AppLog.sync.info("Cleaned \(cleaned) invalid queued TCX file(s) on startup")
         }
         refreshCounts()
     }
@@ -150,7 +150,7 @@ final class SyncEngine {
 
         let cleaned = queue.cleanupInvalidReadyToUploadTCX()
         if cleaned > 0 {
-            print("[SyncEngine] Cleaned \(cleaned) invalid TCX files before syncing.")
+            AppLog.sync.info("Cleaned \(cleaned) invalid queued TCX file(s) before syncing")
             refreshCounts()
         }
 
@@ -197,7 +197,7 @@ final class SyncEngine {
             }
             refreshCounts()
         } catch {
-            print("[SyncEngine] Error en scan: \(error)")
+            AppLog.sync.error("HealthKit scan failed: \(error.localizedDescription, privacy: .private)")
             // No fatal — continuamos con lo que haya en cola
         }
     }
@@ -249,7 +249,7 @@ final class SyncEngine {
                     tcxData = try Data(contentsOf: tcxFileURL)
                     if let tcxString = String(data: tcxData, encoding: .utf8) {
                         if let rejectionReason = savedTCXRejectionReason(tcxString, item: currentItem) {
-                            print("[SyncEngine] Skipping \(item.workoutUUID): \(rejectionReason)")
+                            AppLog.sync.info("Skipping queued workout with invalid TCX: \(rejectionReason, privacy: .private)")
                             queue.markSkipped(
                                 uuid: item.workoutUUID,
                                 reason: rejectionReason
@@ -259,9 +259,8 @@ final class SyncEngine {
                             continue
                         }
 
-                        logTCXDebug(tcxString, fileURL: tcxFileURL, uuid: item.workoutUUID)
                     } else {
-                        print("[SyncEngine][Debug] existing-tcx uuid=\(item.workoutUUID) file=\(tcxFileURL.path) bytes=\(tcxData.count) not valid UTF-8")
+                        AppLog.sync.error("Queued TCX file is not valid UTF-8")
                         queue.markFailed(uuid: item.workoutUUID, error: "TCX guardado no es UTF-8 válido.")
                         refreshCounts()
                         continue
@@ -290,7 +289,6 @@ final class SyncEngine {
                     }
 
                     if let rejectionReason = routeRejectionReason(for: detail) {
-                        logWorkoutDetail(detail, uuid: item.workoutUUID, stage: "skip-invalid-route")
                         queue.markSkipped(
                             uuid: item.workoutUUID,
                             reason: rejectionReason
@@ -312,9 +310,6 @@ final class SyncEngine {
 
                     // 4. Guardar TCX en Application Support/TCXQueue/<uuid>.tcx
                     try tcxString.write(to: tcxFileURL, atomically: true, encoding: .utf8)
-                    logWorkoutDetail(detail, uuid: item.workoutUUID, stage: "generated-tcx")
-                    logTCXDebug(tcxString, fileURL: tcxFileURL, uuid: item.workoutUUID)
-
                     let relativePath = "\(item.workoutUUID).tcx"
                     queue.markReadyToUpload(uuid: item.workoutUUID, tcxFilePath: relativePath)
                     tcxData = data
@@ -323,7 +318,6 @@ final class SyncEngine {
                 // 5. Programar subida background. El delegate confirmará uploaded tras HTTP 2xx.
                 syncState = .backgroundUploading(count: uploadAttempts + 1)
 
-                print("[SyncEngine] Scheduling background upload \(item.workoutUUID) bytes=\(tcxData.count) tcxFile=\(tcxFileURL.path)")
                 let scheduled = try backgroundUploadService.scheduleUpload(
                     uuid: item.workoutUUID,
                     tcxFileURL: tcxFileURL,
@@ -341,11 +335,7 @@ final class SyncEngine {
 
             } catch let error as EndurainClientError {
                 let msg = error.errorDescription ?? error.localizedDescription
-                let debugTCXPath = queue.tcxQueueDirectoryURL
-                    .appendingPathComponent("\(item.workoutUUID).tcx")
-                    .path
-                print("[SyncEngine] Upload failed for \(item.workoutUUID): \(msg)")
-                print("[SyncEngine] Kept TCX for debug at: \(debugTCXPath)")
+                AppLog.sync.error("Upload scheduling failed: \(msg, privacy: .private)")
                 refreshCounts()
                 // Para 401/403 (API key inválida) — detener la cola, no tiene sentido continuar
                 if case .unauthorized = error {
@@ -377,7 +367,7 @@ final class SyncEngine {
                 refreshCounts()
             } catch {
                 let msg = error.localizedDescription
-                print("[SyncEngine] Error inesperado para \(item.workoutUUID): \(msg)")
+                AppLog.sync.error("Unexpected sync error: \(msg, privacy: .private)")
                 queue.markFailed(uuid: item.workoutUUID, error: msg)
                 refreshCounts()
             }
@@ -452,40 +442,6 @@ final class SyncEngine {
             queue.requeue(uuid: failed.workoutUUID, error: failed.lastError)
         }
         refreshCounts()
-    }
-
-    private func logWorkoutDetail(_ detail: WorkoutDetail, uuid: String, stage: String) {
-        let first = detail.routePoints.first
-        let last = detail.routePoints.last
-        let distance = detail.totalDistanceMeters.map { String(format: "%.2f", $0) } ?? "nil"
-        let kcal = detail.activeEnergyKcal.map { String(format: "%.0f", $0) } ?? "nil"
-
-        print("""
-        [SyncEngine][Debug] \(stage) uuid=\(uuid)
-          type=\(detail.activityTypeName) hkType=\(detail.activityType.rawValue)
-          start=\(detail.startDate) end=\(detail.endDate) duration=\(String(format: "%.2f", detail.durationSeconds))s
-          distanceMeters=\(distance) activeEnergyKcal=\(kcal)
-          routePoints=\(detail.routePoints.count) heartRateSamples=\(detail.heartRateSamples.count)
-          firstPoint=\(debugPoint(first))
-          lastPoint=\(debugPoint(last))
-        """)
-    }
-
-    private func logTCXDebug(_ tcx: String, fileURL: URL, uuid: String) {
-        let preview = String(tcx.prefix(tcxLogPreviewLimit))
-            .replacingOccurrences(of: "\n", with: "\\n")
-        let trackpointCount = tcx.components(separatedBy: "<Trackpoint>").count - 1
-        let hasActivity = tcx.contains("<Activity Sport=")
-        let hasLap = tcx.contains("<Lap StartTime=")
-        let hasTrack = tcx.contains("<Track>")
-
-        print("""
-        [SyncEngine][Debug] tcx uuid=\(uuid)
-          file=\(fileURL.path)
-          characters=\(tcx.count) utf8Bytes=\(tcx.utf8.count)
-          trackpoints=\(trackpointCount) hasActivity=\(hasActivity) hasLap=\(hasLap) hasTrack=\(hasTrack)
-          preview=\(preview)
-        """)
     }
 
     private func tcxTrackpointCount(_ tcx: String) -> Int {
@@ -567,18 +523,6 @@ final class SyncEngine {
         }
 
         return nil
-    }
-
-    private func debugPoint(_ point: RoutePoint?) -> String {
-        guard let point else { return "nil" }
-        return String(
-            format: "time=%@ lat=%.7f lon=%.7f alt=%@ hAcc=%@",
-            String(describing: point.timestamp),
-            point.latitude,
-            point.longitude,
-            point.altitude.map { String(format: "%.2f", $0) } ?? "nil",
-            point.horizontalAccuracy.map { String(format: "%.2f", $0) } ?? "nil"
-        )
     }
 
     private static let tcxDateFormatter: DateFormatter = {

@@ -27,12 +27,17 @@ struct SettingsView: View {
     // MARK: - Validation
 
     private var isValidURL: Bool {
-        serverURL.hasPrefix("https://") && serverURL.count > 8
+        (try? ServerURLNormalizer.normalize(serverURL)) != nil
     }
 
     private var urlErrorMessage: String? {
-        guard !serverURL.isEmpty, !serverURL.hasPrefix("https://") else { return nil }
-        return "La URL debe comenzar por https://"
+        guard !serverURL.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return nil }
+        do {
+            _ = try ServerURLNormalizer.normalize(serverURL)
+            return nil
+        } catch {
+            return error.localizedDescription
+        }
     }
 
     private var canSave: Bool {
@@ -93,7 +98,7 @@ struct SettingsView: View {
                 } header: {
                     Text("Servidor Endurain")
                 } footer: {
-                    Text("Dirección completa de tu instancia self-hosted. Debe usar HTTPS.")
+                    Text("Dirección de tu instancia self-hosted. Si no indicas esquema se usará HTTPS.")
                 }
 
                 // MARK: API Key
@@ -142,11 +147,19 @@ struct SettingsView: View {
         serverStatus = .checking
         defer { isSaving = false }
 
-        let trimmedURL = serverURL.trimmingCharacters(in: .whitespacesAndNewlines)
         let trimmedKey = apiKey.trimmingCharacters(in: .whitespacesAndNewlines)
 
+        let normalizedURL: String
+        do {
+            normalizedURL = try ServerURLNormalizer.normalize(serverURL)
+        } catch {
+            saveError = error.localizedDescription
+            serverStatus = .idle
+            return
+        }
+
         // Comprobar servidor antes de guardar
-        let client = EndurainClient(serverURL: trimmedURL, apiKey: trimmedKey)
+        let client = EndurainClient(serverURL: normalizedURL, apiKey: trimmedKey)
         do {
             _ = try await client.testConnection()
             serverStatus = .ok
@@ -157,7 +170,7 @@ struct SettingsView: View {
 
         // Guardar siempre, aunque el servidor no responda
         do {
-            try store.save(serverURL: trimmedURL, apiKey: trimmedKey)
+            try store.save(serverURL: normalizedURL, apiKey: trimmedKey)
         } catch {
             saveError = "Error al guardar: \(error.localizedDescription)"
         }

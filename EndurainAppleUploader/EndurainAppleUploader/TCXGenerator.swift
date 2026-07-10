@@ -14,7 +14,7 @@ struct TCXGenerator {
     // MARK: - Public entry point
 
     static func generate(from detail: WorkoutDetail) -> String {
-        let sport = sportString(for: detail.activityType)
+        let sport = xmlEscaped(sportString(for: detail.activityType))
         let startISO = iso8601(detail.startDate)
 
         var xml = ""
@@ -150,5 +150,14 @@ struct TCXGenerator {
 
     private static func iso8601(_ date: Date) -> String {
         iso8601Formatter.string(from: date)
+    }
+
+    static func xmlEscaped(_ value: String) -> String {
+        value
+            .replacingOccurrences(of: "&", with: "&amp;")
+            .replacingOccurrences(of: "\"", with: "&quot;")
+            .replacingOccurrences(of: "'", with: "&apos;")
+            .replacingOccurrences(of: "<", with: "&lt;")
+            .replacingOccurrences(of: ">", with: "&gt;")
     }
 }

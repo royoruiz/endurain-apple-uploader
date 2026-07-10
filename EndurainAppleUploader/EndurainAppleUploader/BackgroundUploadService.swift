@@ -6,6 +6,7 @@
 //
 
 import Foundation
+import os
 
 @MainActor
 final class BackgroundUploadService: NSObject, @preconcurrency URLSessionTaskDelegate, @preconcurrency URLSessionDataDelegate {
@@ -13,8 +14,6 @@ final class BackgroundUploadService: NSObject, @preconcurrency URLSessionTaskDel
     static let sessionIdentifier = "es.overtus.endurainsync.upload"
 
     private static let uploadPath = "/api/v1/activities/create/upload"
-    private static let fileFieldName = "file"
-    private static let tcxContentType = "application/vnd.garmin.tcx+xml"
     private static let multipartSubdir = "MultipartUploads"
 
     private let queue: SyncQueueStore
@@ -50,7 +49,7 @@ final class BackgroundUploadService: NSObject, @preconcurrency URLSessionTaskDel
         apiKey: String
     ) throws -> Bool {
         if let existing = queue.item(for: uuid), existing.status == .uploading {
-            print("[BackgroundUploadService] Skip already-uploading uuid=\(uuid) task=\(existing.backgroundTaskIdentifier.map(String.init) ?? "nil")")
+            AppLog.upload.info("Skipping already active background upload for workout \(uuid, privacy: .private), task \(existing.backgroundTaskIdentifier ?? -1)")
             return false
         }
 
@@ -82,7 +81,7 @@ final class BackgroundUploadService: NSObject, @preconcurrency URLSessionTaskDel
             multipartFilePath: relativeMultipartPath
         )
 
-        print("[BackgroundUploadService] Scheduled upload uuid=\(uuid) task=\(task.taskIdentifier) file=\(multipartFileURL.path)")
+        AppLog.upload.info("Scheduled background upload task \(task.taskIdentifier) for workout \(uuid, privacy: .private)")
         task.resume()
         return true
     }
@@ -119,37 +118,39 @@ final class BackgroundUploadService: NSObject, @preconcurrency URLSessionTaskDel
         let bodySummary = String(body.prefix(500))
         let statusCode = responseStatusCodes[taskID] ?? (task.response as? HTTPURLResponse)?.statusCode
 
-        print("[BackgroundUploadService] Completed task=\(taskID) uuid=\(item.workoutUUID) status=\(statusCode.map(String.init) ?? "nil") error=\(error?.localizedDescription ?? "nil") body=\(bodySummary)")
-
         defer {
             cleanup(taskIdentifier: taskID, multipartPath: item.multipartFilePath)
             onQueueChanged?()
         }
 
         if let error {
+            AppLog.upload.error("Background upload task \(taskID) failed: \(error.localizedDescription, privacy: .private)")
             queue.requeue(uuid: item.workoutUUID, error: "Error de red en background upload: \(error.localizedDescription)")
             return
         }
 
         guard let statusCode else {
+            AppLog.upload.error("Background upload task \(taskID) completed without HTTP response")
             queue.requeue(uuid: item.workoutUUID, error: "Respuesta HTTP ausente en background upload.")
             return
         }
 
-        switch statusCode {
-        case 200...299:
+        switch UploadStatusMapper.map(statusCode: statusCode, bodySummary: bodySummary) {
+        case .success:
             queue.markUploaded(uuid: item.workoutUUID, serverURL: item.serverURL ?? "")
             deleteTCXIfPresent(item)
-            print("[BackgroundUploadService] Uploaded uuid=\(item.workoutUUID) status=\(statusCode)")
-        case 401, 403:
+            AppLog.upload.info("Background upload task \(taskID) completed with status \(statusCode)")
+        case .failure(.unauthorized):
             queue.markFailed(uuid: item.workoutUUID, error: "API key no autorizada o sin scope activities:upload")
-        case 409:
+        case .failure(.duplicate):
             queue.markUploaded(uuid: item.workoutUUID, serverURL: item.serverURL ?? "")
             deleteTCXIfPresent(item)
-        case 429, 500...599:
-            queue.requeue(uuid: item.workoutUUID, error: "HTTP \(statusCode): \(bodySummary)")
-        default:
-            queue.markFailed(uuid: item.workoutUUID, error: "HTTP \(statusCode): \(bodySummary)")
+        case .failure(.rateLimited):
+            queue.requeue(uuid: item.workoutUUID, error: "Endurain limitó las peticiones. Se reintentará automáticamente.")
+        case .failure(.serverError):
+            queue.requeue(uuid: item.workoutUUID, error: "Endurain devolvió un error de servidor. Se reintentará automáticamente.")
+        case .failure:
+            queue.markFailed(uuid: item.workoutUUID, error: "Endurain devolvió HTTP \(statusCode).")
         }
     }
 
@@ -171,19 +172,12 @@ final class BackgroundUploadService: NSObject, @preconcurrency URLSessionTaskDel
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
 
         let outputURL = directory.appendingPathComponent("\(uuid).multipart")
-        if FileManager.default.fileExists(atPath: outputURL.path) {
-            try FileManager.default.removeItem(at: outputURL)
-        }
-        FileManager.default.createFile(atPath: outputURL.path, contents: nil)
-
-        let handle = try FileHandle(forWritingTo: outputURL)
-        defer { try? handle.close() }
-
-        try handle.write(contentsOf: Data("--\(boundary)\r\n".utf8))
-        try handle.write(contentsOf: Data("Content-Disposition: form-data; name=\"\(Self.fileFieldName)\"; filename=\"\(filename)\"\r\n".utf8))
-        try handle.write(contentsOf: Data("Content-Type: \(Self.tcxContentType)\r\n\r\n".utf8))
-        try handle.write(contentsOf: Data(contentsOf: tcxFileURL))
-        try handle.write(contentsOf: Data("\r\n--\(boundary)--\r\n".utf8))
+        try MultipartFormBuilder.writeBodyFile(
+            tcxFileURL: tcxFileURL,
+            filename: filename,
+            boundary: boundary,
+            outputURL: outputURL
+        )
 
         return outputURL
     }

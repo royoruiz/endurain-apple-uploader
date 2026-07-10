@@ -6,12 +6,13 @@
 //
 
 import Foundation
+import os
 
 // MARK: - Upload result
 
 struct UploadResult {
     let statusCode: Int
-    let responseBody: String   // primeros 500 chars, para debug
+    let responseBody: String
 }
 
 // MARK: - Errors
@@ -63,9 +64,6 @@ struct EndurainClient {
     // Endpoint de subida de actividades
     private static let uploadActivityPath = "/api/v1/activities/create/upload"
 
-    // Nombre del campo multipart — cambiar aquí si Endurain espera otro nombre
-    private static let fileFieldName = "file"
-
     private let serverURL: String
     private let apiKey: String
 
@@ -92,6 +90,7 @@ struct EndurainClient {
         do {
             (_, response) = try await URLSession.shared.data(for: request)
         } catch {
+            AppLog.upload.error("Connection test failed: \(error.localizedDescription, privacy: .private)")
             throw EndurainClientError.networkError(error)
         }
 
@@ -121,9 +120,7 @@ struct EndurainClient {
         }
 
         let boundary = "Boundary-\(UUID().uuidString)"
-        let body = buildMultipartBody(tcxData: tcxData, filename: filename, boundary: boundary)
-
-        print("[EndurainClient][Debug] POST \(url.absoluteString) filename=\(filename) tcxBytes=\(tcxData.count) multipartBytes=\(body.count)")
+        let body = MultipartFormBuilder.body(tcxData: tcxData, filename: filename, boundary: boundary)
 
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
@@ -136,6 +133,7 @@ struct EndurainClient {
         do {
             (responseData, response) = try await URLSession.shared.data(for: request)
         } catch {
+            AppLog.upload.error("Foreground upload failed: \(error.localizedDescription, privacy: .private)")
             throw EndurainClientError.networkError(error)
         }
 
@@ -145,53 +143,12 @@ struct EndurainClient {
 
         let bodyString = String(data: responseData, encoding: .utf8) ?? ""
         let bodySummary = String(bodyString.prefix(500))
-        let contentType = http.value(forHTTPHeaderField: "Content-Type") ?? "nil"
 
-        print("[EndurainClient][Debug] response status=\(http.statusCode) contentType=\(contentType) body=\(bodySummary.isEmpty ? "(empty)" : bodySummary)")
-
-        switch http.statusCode {
-        case 200...299:
-            return UploadResult(statusCode: http.statusCode, responseBody: bodySummary)
-        case 401, 403:
-            throw EndurainClientError.unauthorized
-        case 409:
-            throw EndurainClientError.duplicate(bodySummary)
-        case 429:
-            throw EndurainClientError.rateLimited(bodySummary)
-        case 500...599:
-            throw EndurainClientError.serverError(http.statusCode, bodySummary)
-        default:
-            throw EndurainClientError.uploadError(http.statusCode, bodySummary)
-        }
-    }
-
-    // MARK: - Multipart builder
-
-    private func buildMultipartBody(tcxData: Data, filename: String, boundary: String) -> Data {
-        var body = Data()
-        let crlf = "\r\n"
-
-        // Parte del fichero
-        body.append("--\(boundary)\(crlf)")
-        body.append("Content-Disposition: form-data; name=\"\(Self.fileFieldName)\"; filename=\"\(filename)\"\(crlf)")
-        body.append("Content-Type: application/vnd.garmin.tcx+xml\(crlf)")
-        body.append(crlf)
-        body.append(tcxData)
-        body.append(crlf)
-
-        // Cierre
-        body.append("--\(boundary)--\(crlf)")
-
-        return body
-    }
-}
-
-// MARK: - Data helper
-
-private extension Data {
-    mutating func append(_ string: String) {
-        if let data = string.data(using: .utf8) {
-            append(data)
+        switch UploadStatusMapper.map(statusCode: http.statusCode, bodySummary: bodySummary) {
+        case .success(let result):
+            return result
+        case .failure(let error):
+            throw error
         }
     }
 }
