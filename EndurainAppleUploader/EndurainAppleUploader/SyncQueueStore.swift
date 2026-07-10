@@ -14,7 +14,7 @@ import os
 
 // MARK: - SyncStatus
 
-enum SyncStatus: String, Codable, Equatable {
+enum SyncStatus: String, Codable, Equatable, Hashable {
     case discovered     // detectado, aún no evaluado
     case queued         // listo para generar TCX y subir
     case generating     // generando TCX en este momento
@@ -28,6 +28,9 @@ enum SyncStatus: String, Codable, Equatable {
 // MARK: - SyncQueueItem
 
 struct SyncQueueItem: Codable, Identifiable {
+    var namespaceID: String? = nil      // nil en registros legacy previos al modelo server+user
+    var normalizedServerURL: String? = nil
+    var normalizedUserIdentifier: String? = nil
     var workoutUUID: String      // HKWorkout.uuid.uuidString — clave de deduplicación
     var startDate: Date
     var endDate: Date
@@ -46,22 +49,33 @@ struct SyncQueueItem: Codable, Identifiable {
     var uploadStartedAt: Date?
     var createdAt: Date
 
-    // Identifiable — usa workoutUUID como ID
-    var id: String { workoutUUID }
+    var id: String { (namespaceID ?? "legacy") + ":" + workoutUUID }
+
+    var isLegacy: Bool { namespaceID == nil || namespaceID?.isEmpty == true }
 }
 
 // MARK: - SyncQueueStore
 
 final class SyncQueueStore {
 
+    private enum DuplicateTolerance {
+        static let startDateSeconds: TimeInterval = 2 * 60
+        static let durationSeconds: TimeInterval = 2 * 60
+        static let durationRatio = 0.05
+        static let distanceMeters = 250.0
+        static let distanceRatio = 0.05
+    }
+
     // MARK: - File paths
 
     private static let appSupportSubdir = "EndurainAppleUploader"
     private static let queueFilename    = "sync-queue.json"
     private static let tcxQueueSubdir   = "TCXQueue"
+    static let multipartSubdir = "MultipartUploads"
 
     private let queueFileURL: URL
     let tcxQueueDirectoryURL: URL
+    let storageDirectoryURL: URL
 
     // MARK: - State (acceso serializado por un actor interno)
 
@@ -98,6 +112,7 @@ final class SyncQueueStore {
         let subdir = baseDirectory.appendingPathComponent(Self.appSupportSubdir, isDirectory: true)
         try FileManager.default.createDirectory(at: subdir, withIntermediateDirectories: true)
 
+        storageDirectoryURL = subdir
         queueFileURL = subdir.appendingPathComponent(Self.queueFilename)
 
         tcxQueueDirectoryURL = subdir.appendingPathComponent(Self.tcxQueueSubdir, isDirectory: true)
@@ -142,23 +157,69 @@ final class SyncQueueStore {
         }
     }
 
+    // MARK: - Clear
+
+    func clearAll() throws {
+        resetInMemoryState()
+        try deleteStorageFile()
+        try clearDirectoryContents(tcxQueueDirectoryURL)
+        try clearDirectoryContents(storageDirectoryURL.appendingPathComponent(Self.multipartSubdir, isDirectory: true))
+    }
+
+    func deleteHistory(namespaceID: String) throws {
+        let removed = items.filter { $0.namespaceID == namespaceID }
+        items.removeAll { $0.namespaceID == namespaceID }
+        save()
+
+        for item in removed {
+            if let tcxFilePath = item.tcxFilePath {
+                try? FileManager.default.removeItem(at: tcxQueueDirectoryURL.appendingPathComponent(tcxFilePath))
+            }
+            if let multipartFilePath = item.multipartFilePath {
+                try? FileManager.default.removeItem(at: storageDirectoryURL.appendingPathComponent(multipartFilePath))
+            }
+        }
+
+        try? removeDirectoryIfEmpty(tcxQueueDirectoryURL.appendingPathComponent(namespaceID, isDirectory: true))
+        try? removeDirectoryIfEmpty(
+            storageDirectoryURL
+                .appendingPathComponent(Self.multipartSubdir, isDirectory: true)
+                .appendingPathComponent(namespaceID, isDirectory: true)
+        )
+    }
+
+    func deleteStorageFile() throws {
+        if FileManager.default.fileExists(atPath: queueFileURL.path) {
+            try FileManager.default.removeItem(at: queueFileURL)
+        }
+    }
+
+    func resetInMemoryState() {
+        items = []
+    }
+
     // MARK: - Upsert
 
     /// Añade el workout a la cola si no existe, o lo ignora si ya está.
     /// Nunca regresa a queued un item que ya está uploaded.
     func upsertWorkout(
+        namespaceID: String,
+        normalizedServerURL: String,
+        normalizedUserIdentifier: String,
         uuid: String,
         startDate: Date,
         endDate: Date,
         activityTypeName: String,
         durationSeconds: Double,
         distanceMeters: Double?,
-        serverURL: String
     ) {
         // Si ya existe, no hacer nada (preserva estado actual)
-        if items.contains(where: { $0.workoutUUID == uuid }) { return }
+        if items.contains(where: { $0.namespaceID == namespaceID && $0.workoutUUID == uuid }) { return }
 
         let item = SyncQueueItem(
+            namespaceID: namespaceID,
+            normalizedServerURL: normalizedServerURL,
+            normalizedUserIdentifier: normalizedUserIdentifier,
             workoutUUID: uuid,
             startDate: startDate,
             endDate: endDate,
@@ -170,7 +231,7 @@ final class SyncQueueStore {
             retryCount: 0,
             lastError: nil,
             uploadedAt: nil,
-            serverURL: serverURL,
+            serverURL: normalizedServerURL,
             fileHash: nil,
             backgroundTaskIdentifier: nil,
             multipartFilePath: nil,
@@ -181,10 +242,47 @@ final class SyncQueueStore {
         save()
     }
 
+    func likelyDuplicate(
+        namespaceID: String,
+        uuid: String,
+        startDate: Date,
+        activityTypeName: String,
+        durationSeconds: Double,
+        distanceMeters: Double?
+    ) -> SyncQueueItem? {
+        items.first { item in
+            guard item.namespaceID == namespaceID else { return false }
+            guard item.workoutUUID != uuid else { return false }
+            return isLikelySameActivity(
+                item,
+                startDate: startDate,
+                activityTypeName: activityTypeName,
+                durationSeconds: durationSeconds,
+                distanceMeters: distanceMeters
+            )
+        }
+    }
+
+    func likelyDuplicate(of item: SyncQueueItem, restrictedTo statuses: Set<SyncStatus>? = nil) -> SyncQueueItem? {
+        guard let namespaceID = item.namespaceID else { return nil }
+        return items.first { candidate in
+            guard candidate.namespaceID == namespaceID else { return false }
+            guard candidate.workoutUUID != item.workoutUUID else { return false }
+            if let statuses, !statuses.contains(candidate.status) { return false }
+            return isLikelySameActivity(
+                candidate,
+                startDate: item.startDate,
+                activityTypeName: item.activityTypeName,
+                durationSeconds: item.durationSeconds,
+                distanceMeters: item.distanceMeters
+            )
+        }
+    }
+
     // MARK: - Status transitions
 
-    func markGenerating(uuid: String) {
-        mutate(uuid: uuid) {
+    func markGenerating(namespaceID: String, uuid: String) {
+        mutate(namespaceID: namespaceID, uuid: uuid) {
             $0.status = .generating
             $0.backgroundTaskIdentifier = nil
             $0.multipartFilePath = nil
@@ -192,8 +290,8 @@ final class SyncQueueStore {
         }
     }
 
-    func markReadyToUpload(uuid: String, tcxFilePath: String, fileHash: String? = nil) {
-        mutate(uuid: uuid) {
+    func markReadyToUpload(namespaceID: String, uuid: String, tcxFilePath: String, fileHash: String? = nil) {
+        mutate(namespaceID: namespaceID, uuid: uuid) {
             $0.status = .readyToUpload
             $0.tcxFilePath = tcxFilePath
             $0.fileHash = fileHash
@@ -203,8 +301,8 @@ final class SyncQueueStore {
         }
     }
 
-    func markUploading(uuid: String, taskIdentifier: Int? = nil, multipartFilePath: String? = nil) {
-        mutate(uuid: uuid) {
+    func markUploading(namespaceID: String, uuid: String, taskIdentifier: Int? = nil, multipartFilePath: String? = nil) {
+        mutate(namespaceID: namespaceID, uuid: uuid) {
             $0.status = .uploading
             $0.backgroundTaskIdentifier = taskIdentifier
             $0.multipartFilePath = multipartFilePath
@@ -212,8 +310,8 @@ final class SyncQueueStore {
         }
     }
 
-    func markUploaded(uuid: String, serverURL: String) {
-        mutate(uuid: uuid) {
+    func markUploaded(namespaceID: String, uuid: String, serverURL: String) {
+        mutate(namespaceID: namespaceID, uuid: uuid) {
             $0.status = .uploaded
             $0.uploadedAt = Date()
             $0.serverURL = serverURL
@@ -224,16 +322,16 @@ final class SyncQueueStore {
         }
     }
 
-    func markSkipped(uuid: String, reason: String) {
-        mutate(uuid: uuid) {
+    func markSkipped(namespaceID: String, uuid: String, reason: String) {
+        mutate(namespaceID: namespaceID, uuid: uuid) {
             $0.status = .skipped
             $0.lastError = reason
             $0.uploadStartedAt = nil
         }
     }
 
-    func markFailed(uuid: String, error: String) {
-        mutate(uuid: uuid) {
+    func markFailed(namespaceID: String, uuid: String, error: String) {
+        mutate(namespaceID: namespaceID, uuid: uuid) {
             $0.status = .failed
             $0.lastError = error
             $0.retryCount += 1
@@ -243,8 +341,8 @@ final class SyncQueueStore {
         }
     }
 
-    func requeue(uuid: String, error: String? = nil) {
-        mutate(uuid: uuid) {
+    func requeue(namespaceID: String, uuid: String, error: String? = nil) {
+        mutate(namespaceID: namespaceID, uuid: uuid) {
             $0.status = $0.tcxFilePath == nil ? .queued : .readyToUpload
             $0.lastError = error
             $0.backgroundTaskIdentifier = nil
@@ -254,8 +352,8 @@ final class SyncQueueStore {
     }
 
     // Re-encola un item failed para volver a intentarlo
-    func requeueFailed(uuid: String) {
-        mutate(uuid: uuid) {
+    func requeueFailed(namespaceID: String, uuid: String) {
+        mutate(namespaceID: namespaceID, uuid: uuid) {
             guard $0.status == .failed else { return }
             $0.status = .queued
             $0.lastError = nil
@@ -264,18 +362,18 @@ final class SyncQueueStore {
 
     // MARK: - Queries
 
-    func pendingItems() -> [SyncQueueItem] {
-        items.filter { $0.status == .queued || $0.status == .readyToUpload }
+    func pendingItems(namespaceID: String) -> [SyncQueueItem] {
+        items.filter { $0.namespaceID == namespaceID && ($0.status == .queued || $0.status == .readyToUpload) }
             .sorted { $0.startDate < $1.startDate }
     }
 
-    func failedItems() -> [SyncQueueItem] {
-        items.filter { $0.status == .failed }
+    func failedItems(namespaceID: String) -> [SyncQueueItem] {
+        items.filter { $0.namespaceID == namespaceID && $0.status == .failed }
             .sorted { $0.startDate < $1.startDate }
     }
 
-    func skippedItems() -> [SyncQueueItem] {
-        items.filter { $0.status == .skipped }
+    func skippedItems(namespaceID: String) -> [SyncQueueItem] {
+        items.filter { $0.namespaceID == namespaceID && $0.status == .skipped }
             .sorted { $0.startDate < $1.startDate }
     }
 
@@ -284,7 +382,8 @@ final class SyncQueueStore {
         var cleaned = 0
 
         for index in items.indices {
-            guard items[index].status == .readyToUpload,
+            guard items[index].namespaceID != nil,
+                  items[index].status == .readyToUpload,
                   let relativePath = items[index].tcxFilePath else { continue }
 
             let fileURL = tcxQueueDirectoryURL.appendingPathComponent(relativePath)
@@ -317,21 +416,25 @@ final class SyncQueueStore {
         return cleaned
     }
 
-    func uploadedItems() -> [SyncQueueItem] {
-        items.filter { $0.status == .uploaded }
+    func uploadedItems(namespaceID: String) -> [SyncQueueItem] {
+        items.filter { $0.namespaceID == namespaceID && $0.status == .uploaded }
             .sorted { ($0.uploadedAt ?? $0.startDate) > ($1.uploadedAt ?? $1.startDate) }
     }
 
-    func latestUploaded() -> SyncQueueItem? {
-        uploadedItems().first
+    func latestUploaded(namespaceID: String) -> SyncQueueItem? {
+        uploadedItems(namespaceID: namespaceID).first
     }
 
-    func isUploaded(uuid: String) -> Bool {
-        items.first(where: { $0.workoutUUID == uuid })?.status == .uploaded
+    func isUploaded(namespaceID: String, uuid: String) -> Bool {
+        items.first(where: { $0.namespaceID == namespaceID && $0.workoutUUID == uuid })?.status == .uploaded
     }
 
-    func item(for uuid: String) -> SyncQueueItem? {
-        items.first(where: { $0.workoutUUID == uuid })
+    func item(namespaceID: String, uuid: String) -> SyncQueueItem? {
+        items.first(where: { $0.namespaceID == namespaceID && $0.workoutUUID == uuid })
+    }
+
+    func legacyItems() -> [SyncQueueItem] {
+        items.filter(\.isLegacy)
     }
 
     func item(forTaskIdentifier taskIdentifier: Int) -> SyncQueueItem? {
@@ -368,20 +471,20 @@ final class SyncQueueStore {
         if changed { save() }
     }
 
-    var pendingCount: Int {
-        items.filter { $0.status == .queued || $0.status == .readyToUpload }.count
+    func pendingCount(namespaceID: String) -> Int {
+        items.filter { $0.namespaceID == namespaceID && ($0.status == .queued || $0.status == .readyToUpload) }.count
     }
 
-    var failedCount: Int {
-        items.filter { $0.status == .failed }.count
+    func failedCount(namespaceID: String) -> Int {
+        items.filter { $0.namespaceID == namespaceID && $0.status == .failed }.count
     }
 
-    var skippedCount: Int {
-        items.filter { $0.status == .skipped }.count
+    func skippedCount(namespaceID: String) -> Int {
+        items.filter { $0.namespaceID == namespaceID && $0.status == .skipped }.count
     }
 
-    var uploadingCount: Int {
-        items.filter { $0.status == .uploading }.count
+    func uploadingCount(namespaceID: String) -> Int {
+        items.filter { $0.namespaceID == namespaceID && $0.status == .uploading }.count
     }
 
     var totalCount: Int { items.count }
@@ -403,9 +506,62 @@ final class SyncQueueStore {
 
     // MARK: - Private
 
-    private func mutate(uuid: String, transform: (inout SyncQueueItem) -> Void) {
-        guard let idx = items.firstIndex(where: { $0.workoutUUID == uuid }) else { return }
+    private func mutate(namespaceID: String, uuid: String, transform: (inout SyncQueueItem) -> Void) {
+        guard let idx = items.firstIndex(where: { $0.namespaceID == namespaceID && $0.workoutUUID == uuid }) else { return }
         transform(&items[idx])
         save()
+    }
+
+    private func removeDirectoryIfEmpty(_ directoryURL: URL) throws {
+        guard FileManager.default.fileExists(atPath: directoryURL.path) else { return }
+        let contents = try FileManager.default.contentsOfDirectory(at: directoryURL, includingPropertiesForKeys: nil)
+        if contents.isEmpty {
+            try FileManager.default.removeItem(at: directoryURL)
+        }
+    }
+
+    private func clearDirectoryContents(_ directoryURL: URL) throws {
+        guard FileManager.default.fileExists(atPath: directoryURL.path) else { return }
+        let contents = try FileManager.default.contentsOfDirectory(
+            at: directoryURL,
+            includingPropertiesForKeys: nil
+        )
+        for url in contents {
+            try FileManager.default.removeItem(at: url)
+        }
+    }
+
+    private func isLikelySameActivity(
+        _ item: SyncQueueItem,
+        startDate: Date,
+        activityTypeName: String,
+        durationSeconds: Double,
+        distanceMeters: Double?
+    ) -> Bool {
+        guard item.activityTypeName == activityTypeName else { return false }
+
+        let startDelta = abs(item.startDate.timeIntervalSince(startDate))
+        guard startDelta <= DuplicateTolerance.startDateSeconds else { return false }
+
+        let durationDelta = abs(item.durationSeconds - durationSeconds)
+        let maxDurationDelta = max(
+            DuplicateTolerance.durationSeconds,
+            max(item.durationSeconds, durationSeconds) * DuplicateTolerance.durationRatio
+        )
+        guard durationDelta <= maxDurationDelta else { return false }
+
+        switch (item.distanceMeters, distanceMeters) {
+        case let (.some(existing), .some(incoming)):
+            let distanceDelta = abs(existing - incoming)
+            let maxDistanceDelta = max(
+                DuplicateTolerance.distanceMeters,
+                max(existing, incoming) * DuplicateTolerance.distanceRatio
+            )
+            return distanceDelta <= maxDistanceDelta
+        case (.none, .none):
+            return true
+        default:
+            return false
+        }
     }
 }

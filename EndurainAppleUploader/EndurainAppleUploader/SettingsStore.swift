@@ -14,6 +14,7 @@ final class SettingsStore {
     // MARK: - Published state
 
     private(set) var serverURL: String = ""
+    private(set) var userIdentifier: String = ""
     private(set) var isConfigured: Bool = false
 
     // MARK: - Private
@@ -23,6 +24,12 @@ final class SettingsStore {
 
     private enum Keys {
         static let serverURL = "endurain_server_url"
+        static let userIdentifier = "endurain_user_identifier"
+    }
+
+    enum ConfigurationKey {
+        static let serverURL = Keys.serverURL
+        static let userIdentifier = Keys.userIdentifier
     }
 
     // MARK: - Init
@@ -37,27 +44,41 @@ final class SettingsStore {
 
     private func load() {
         let url = defaults.string(forKey: Keys.serverURL) ?? ""
+        let user = defaults.string(forKey: Keys.userIdentifier) ?? ""
         serverURL = url
-        isConfigured = !url.isEmpty
+        userIdentifier = user
+        isConfigured = !url.isEmpty && !user.isEmpty
     }
 
     // MARK: - Save
 
-    func save(serverURL: String, apiKey: String) throws {
-        let normalizedURL = try ServerURLNormalizer.normalize(serverURL)
-        defaults.set(normalizedURL, forKey: Keys.serverURL)
+    func save(serverURL: String, userIdentifier: String, apiKey: String) throws {
+        let identity = try EndurainConfigurationIdentity(serverURL: serverURL, userIdentifier: userIdentifier)
+        defaults.set(identity.normalizedServerURL, forKey: Keys.serverURL)
+        defaults.set(identity.normalizedUserIdentifier, forKey: Keys.userIdentifier)
         try keychain.save(apiKey)
-        self.serverURL = normalizedURL
+        self.serverURL = identity.normalizedServerURL
+        self.userIdentifier = identity.normalizedUserIdentifier
         self.isConfigured = true
     }
 
     // MARK: - Clear
 
-    func clear() throws {
+    func clearConfigurationOnly() throws {
         defaults.removeObject(forKey: Keys.serverURL)
+        defaults.removeObject(forKey: Keys.userIdentifier)
         try keychain.delete()
         serverURL = ""
+        userIdentifier = ""
         isConfigured = false
+    }
+
+    func currentIdentity() throws -> EndurainConfigurationIdentity {
+        try EndurainConfigurationIdentity(serverURL: serverURL, userIdentifier: userIdentifier)
+    }
+
+    func reload() {
+        load()
     }
 
     // MARK: - Read API Key (for use in client)

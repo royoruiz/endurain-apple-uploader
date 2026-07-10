@@ -30,7 +30,7 @@ final class UploadStore {
 
     private(set) var records: [UploadRecord] = []
 
-    private let defaults = UserDefaults.standard
+    private let defaults: UserDefaults
     private let encoder = JSONEncoder()
     private let decoder = JSONDecoder()
 
@@ -40,7 +40,8 @@ final class UploadStore {
 
     // MARK: - Init
 
-    init() {
+    init(defaults: UserDefaults = .standard) {
+        self.defaults = defaults
         load()
     }
 

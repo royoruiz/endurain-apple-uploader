@@ -14,8 +14,10 @@ struct StatusView: View {
     var healthKitService: HealthKitService
     var syncEngine: SyncEngine
     var healthKitBackgroundObserver: HealthKitBackgroundObserver
+    var resetService: AppResetService
 
     @State private var showConfirmClear = false
+    @State private var deleteUploadHistory = false
 
     // MARK: - Body
 
@@ -38,15 +40,9 @@ struct StatusView: View {
             }
             .navigationTitle("Endurain")
             .navigationBarTitleDisplayMode(.large)
-            .confirmationDialog(
-                "¿Borrar configuración?",
-                isPresented: $showConfirmClear,
-                titleVisibility: .visible
-            ) {
-                Button("Borrar", role: .destructive) { clearConfiguration() }
-                Button("Cancelar", role: .cancel) {}
-            } message: {
-                Text("Se eliminará la URL del servidor y la API Key.")
+            .sheet(isPresented: $showConfirmClear) {
+                deleteConfigurationSheet
+                    .presentationDetents([.medium])
             }
         }
     }
@@ -78,6 +74,11 @@ struct StatusView: View {
                     .foregroundStyle(.secondary)
                     .lineLimit(1)
                     .truncationMode(.middle)
+
+                Text(store.userIdentifier)
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
 
                 queueSummary
 
@@ -234,6 +235,7 @@ struct StatusView: View {
 
     private var bottomActions: some View {
         Button(role: .destructive) {
+            deleteUploadHistory = false
             showConfirmClear = true
         } label: {
             Text("Borrar configuración")
@@ -242,6 +244,34 @@ struct StatusView: View {
         }
         .buttonStyle(.bordered)
         .tint(.red)
+    }
+
+    private var deleteConfigurationSheet: some View {
+        NavigationStack {
+            Form {
+                Section {
+                    Text("Delete server, user and API token from this device?")
+                        .font(.body)
+
+                    Toggle("Also delete upload history for this server/user", isOn: $deleteUploadHistory)
+
+                    Text("If unchecked, reconfiguring the same server and user will not re-upload workouts. Check this only if you are starting with a fresh Endurain database or want to upload everything again.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+
+                Section {
+                    Button("Delete configuration", role: .destructive) {
+                        clearConfiguration(deleteHistory: deleteUploadHistory)
+                    }
+                    Button("Cancel", role: .cancel) {
+                        showConfirmClear = false
+                    }
+                }
+            }
+            .navigationTitle("Borrar configuración")
+            .navigationBarTitleDisplayMode(.inline)
+        }
     }
 
     // MARK: - Format helpers
@@ -271,11 +301,15 @@ struct StatusView: View {
 
     // MARK: - Actions
 
-    private func clearConfiguration() {
-        do {
-            try store.clear()
-        } catch {
-            AppLog.settings.error("Failed to clear settings: \(error.localizedDescription, privacy: .private)")
+    private func clearConfiguration(deleteHistory: Bool) {
+        Task {
+            do {
+                try await resetService.deleteConfiguration(deleteUploadHistory: deleteHistory)
+                syncEngine.handleConfigurationCleared()
+                showConfirmClear = false
+            } catch {
+                AppLog.settings.error("Failed to clear settings: \(error.localizedDescription, privacy: .private)")
+            }
         }
     }
 }
@@ -285,6 +319,13 @@ struct StatusView: View {
     let hk = HealthKitService()
     let queue = try! SyncQueueStore()
     let backgroundUploads = BackgroundUploadService(queue: queue)
+    let uploadStore = UploadStore()
+    let resetService = AppResetService(
+        settings: settings,
+        queue: queue,
+        uploadStore: uploadStore,
+        backgroundUploadService: backgroundUploads
+    )
     StatusView(
         store: settings,
         healthKitService: hk,
@@ -294,6 +335,7 @@ struct StatusView: View {
             settings: settings,
             backgroundUploadService: backgroundUploads
         ),
-        healthKitBackgroundObserver: HealthKitBackgroundObserver()
+        healthKitBackgroundObserver: HealthKitBackgroundObserver(),
+        resetService: resetService
     )
 }

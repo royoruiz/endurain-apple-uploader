@@ -12,6 +12,7 @@ struct SettingsView: View {
     var store: SettingsStore
 
     @State private var serverURL: String = ""
+    @State private var userIdentifier: String = ""
     @State private var apiKey: String = ""
     @State private var isSaving: Bool = false
     @State private var saveError: String? = nil
@@ -41,7 +42,9 @@ struct SettingsView: View {
     }
 
     private var canSave: Bool {
-        isValidURL && !apiKey.trimmingCharacters(in: .whitespaces).isEmpty
+        isValidURL
+            && (try? UserIdentityNormalizer.normalize(userIdentifier)) != nil
+            && !apiKey.trimmingCharacters(in: .whitespaces).isEmpty
     }
 
     // MARK: - Body
@@ -99,6 +102,16 @@ struct SettingsView: View {
                     Text("Servidor Endurain")
                 } footer: {
                     Text("Dirección de tu instancia self-hosted. Si no indicas esquema se usará HTTPS.")
+                }
+
+                Section {
+                    TextField("nicolas", text: $userIdentifier)
+                        .textInputAutocapitalization(.never)
+                        .autocorrectionDisabled()
+                } header: {
+                    Text("Usuario Endurain")
+                } footer: {
+                    Text("Se usa como espacio local de deduplicación. Cambiarlo permite subir a otra cuenta del mismo servidor.")
                 }
 
                 // MARK: API Key
@@ -170,7 +183,7 @@ struct SettingsView: View {
 
         // Guardar siempre, aunque el servidor no responda
         do {
-            try store.save(serverURL: normalizedURL, apiKey: trimmedKey)
+            try store.save(serverURL: normalizedURL, userIdentifier: userIdentifier, apiKey: trimmedKey)
         } catch {
             saveError = "Error al guardar: \(error.localizedDescription)"
         }

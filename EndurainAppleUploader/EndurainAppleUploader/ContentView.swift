@@ -14,6 +14,7 @@ struct ContentView: View {
     var uploadStore: UploadStore
     var syncEngine: SyncEngine
     var healthKitBackgroundObserver: HealthKitBackgroundObserver
+    var resetService: AppResetService
 
     var body: some View {
         if store.isConfigured {
@@ -21,7 +22,8 @@ struct ContentView: View {
                 store: store,
                 healthKitService: healthKitService,
                 syncEngine: syncEngine,
-                healthKitBackgroundObserver: healthKitBackgroundObserver
+                healthKitBackgroundObserver: healthKitBackgroundObserver,
+                resetService: resetService
             )
                 .task {
                     // Al abrir la app: sincronización automática si hay permisos.
@@ -49,6 +51,12 @@ struct ContentView: View {
             settings: settings,
             backgroundUploadService: backgroundUploads
         ),
-        healthKitBackgroundObserver: HealthKitBackgroundObserver()
+        healthKitBackgroundObserver: HealthKitBackgroundObserver(),
+        resetService: AppResetService(
+            settings: settings,
+            queue: queue,
+            uploadStore: UploadStore(),
+            backgroundUploadService: backgroundUploads
+        )
     )
 }

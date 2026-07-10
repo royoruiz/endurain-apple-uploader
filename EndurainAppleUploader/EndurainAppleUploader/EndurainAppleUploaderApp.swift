@@ -19,6 +19,7 @@ struct EndurainAppleUploaderApp: App {
     @State private var backgroundUploadService: BackgroundUploadService
     @State private var healthKitBackgroundObserver: HealthKitBackgroundObserver
     @State private var syncEngine: SyncEngine
+    @State private var resetService: AppResetService
 
     init() {
         let settings = SettingsStore()
@@ -33,6 +34,12 @@ struct EndurainAppleUploaderApp: App {
             settings: settings,
             backgroundUploadService: backgroundUploads
         )
+        let reset = AppResetService(
+            settings: settings,
+            queue: queue,
+            uploadStore: uploads,
+            backgroundUploadService: backgroundUploads
+        )
 
         _settingsStore = State(initialValue: settings)
         _healthKitService = State(initialValue: healthKit)
@@ -41,6 +48,7 @@ struct EndurainAppleUploaderApp: App {
         _backgroundUploadService = State(initialValue: backgroundUploads)
         _healthKitBackgroundObserver = State(initialValue: observer)
         _syncEngine = State(initialValue: engine)
+        _resetService = State(initialValue: reset)
     }
 
     var body: some Scene {
@@ -50,7 +58,8 @@ struct EndurainAppleUploaderApp: App {
                 healthKitService: healthKitService,
                 uploadStore: uploadStore,
                 syncEngine: syncEngine,
-                healthKitBackgroundObserver: healthKitBackgroundObserver
+                healthKitBackgroundObserver: healthKitBackgroundObserver,
+                resetService: resetService
             )
             .task {
                 await backgroundUploadService.reconnect()

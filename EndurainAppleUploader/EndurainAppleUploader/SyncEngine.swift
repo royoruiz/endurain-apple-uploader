@@ -81,6 +81,7 @@ final class SyncEngine {
     private let queue: SyncQueueStore
     private let settings: SettingsStore
     private let backgroundUploadService: BackgroundUploadService
+    private let makeActivityLookup: (String, String) -> EndurainActivityLookup
 
     private var isSyncInProgress = false
     private var automaticContinuationTask: Task<Void, Never>?
@@ -97,12 +98,14 @@ final class SyncEngine {
         hkService: HealthKitService,
         queue: SyncQueueStore,
         settings: SettingsStore,
-        backgroundUploadService: BackgroundUploadService
+        backgroundUploadService: BackgroundUploadService,
+        makeActivityLookup: @escaping (String, String) -> EndurainActivityLookup = { EndurainClient(serverURL: $0, apiKey: $1) }
     ) {
         self.hkService = hkService
         self.queue = queue
         self.settings = settings
         self.backgroundUploadService = backgroundUploadService
+        self.makeActivityLookup = makeActivityLookup
         self.backgroundUploadService.onQueueChanged = { [weak self] in
             self?.refreshCounts()
             self?.refreshIdleStateAfterBackgroundEvent()
@@ -125,6 +128,16 @@ final class SyncEngine {
         await syncAutomatically(scanHealthKit: true)
     }
 
+    func handleConfigurationCleared() {
+        automaticContinuationTask?.cancel()
+        automaticContinuationTask = nil
+        isSyncInProgress = false
+        syncState = .idle
+        lastError = nil
+        lastUploadedItem = nil
+        refreshCounts()
+    }
+
     /// Escanea HealthKit y programa el siguiente lote. Los lotes posteriores se lanzan solos
     /// cuando terminan las subidas en background.
     func syncAutomatically(scanHealthKit: Bool = true) async {
@@ -137,16 +150,25 @@ final class SyncEngine {
         await backgroundUploadService.reconnect()
         refreshCounts()
 
-        if queue.uploadingCount > 0 {
-            syncState = .backgroundUploading(count: queue.uploadingCount)
+        let identity: EndurainConfigurationIdentity
+        do {
+            identity = try settings.currentIdentity()
+        } catch {
+            syncState = .error(error.localizedDescription)
+            lastError = error.localizedDescription
+            return
+        }
+
+        if queue.uploadingCount(namespaceID: identity.namespaceID) > 0 {
+            syncState = .backgroundUploading(count: queue.uploadingCount(namespaceID: identity.namespaceID))
             return
         }
 
         if scanHealthKit {
-            await scanAllWorkouts()
+            await scanAllWorkouts(identity: identity)
         }
 
-        requeueFailedItemsForRetry()
+        requeueFailedItemsForRetry(namespaceID: identity.namespaceID)
 
         let cleaned = queue.cleanupInvalidReadyToUploadTCX()
         if cleaned > 0 {
@@ -154,19 +176,19 @@ final class SyncEngine {
             refreshCounts()
         }
 
-        let pending = queue.pendingItems()
+        let pending = queue.pendingItems(namespaceID: identity.namespaceID)
         guard !pending.isEmpty else {
             syncState = .synced
             refreshCounts()
             return
         }
 
-        await processPendingItems(pending)
+        await processPendingItems(pending, identity: identity)
     }
 
     // MARK: - Scan
 
-    private func scanAllWorkouts() async {
+    private func scanAllWorkouts(identity: EndurainConfigurationIdentity) async {
         syncState = .scanning
 
         guard case .available = hkService.permissionStatus else {
@@ -176,23 +198,33 @@ final class SyncEngine {
 
         do {
             let workouts = try await hkService.fetchWorkoutsSinceBeginning()
-            let serverURL = settings.serverURL
-
             for workout in workouts {
                 let uuid = workout.uuid.uuidString
                 // Si ya está uploaded, ignorar
-                if queue.isUploaded(uuid: uuid) { continue }
+                if queue.isUploaded(namespaceID: identity.namespaceID, uuid: uuid) { continue }
                 // Si ya existe en cualquier otro estado, no duplicar
-                if queue.item(for: uuid) != nil { continue }
+                if queue.item(namespaceID: identity.namespaceID, uuid: uuid) != nil { continue }
+                if queue.likelyDuplicate(
+                    namespaceID: identity.namespaceID,
+                    uuid: uuid,
+                    startDate: workout.startDate,
+                    activityTypeName: workout.workoutActivityType.displayName,
+                    durationSeconds: workout.duration,
+                    distanceMeters: workout.totalDistance?.doubleValue(for: .meter())
+                ) != nil {
+                    continue
+                }
                 // Nuevo: encolar
                 queue.upsertWorkout(
+                    namespaceID: identity.namespaceID,
+                    normalizedServerURL: identity.normalizedServerURL,
+                    normalizedUserIdentifier: identity.normalizedUserIdentifier,
                     uuid: uuid,
                     startDate: workout.startDate,
                     endDate: workout.endDate,
                     activityTypeName: workout.workoutActivityType.displayName,
                     durationSeconds: workout.duration,
-                    distanceMeters: workout.totalDistance?.doubleValue(for: .meter()),
-                    serverURL: serverURL
+                    distanceMeters: workout.totalDistance?.doubleValue(for: .meter())
                 )
             }
             refreshCounts()
@@ -204,7 +236,7 @@ final class SyncEngine {
 
     // MARK: - Process queue
 
-    private func processPendingItems(_ items: [SyncQueueItem]) async {
+    private func processPendingItems(_ items: [SyncQueueItem], identity: EndurainConfigurationIdentity) async {
         let total = items.count
         var current = 0
         var uploadAttempts = 0
@@ -229,7 +261,7 @@ final class SyncEngine {
             if uploadAttempts >= maxUploadsPerBatch { break }
             if inspectedItems >= maxQueueItemsPerRun { break }
 
-            guard let currentItem = queue.item(for: item.workoutUUID),
+            guard let currentItem = queue.item(namespaceID: identity.namespaceID, uuid: item.workoutUUID),
                   currentItem.status == .queued || currentItem.status == .readyToUpload else {
                 continue
             }
@@ -240,7 +272,52 @@ final class SyncEngine {
             syncState = .uploading(name: name, current: current, total: total)
 
             do {
-                let tcxFileURL = queue.tcxQueueDirectoryURL
+                if queue.likelyDuplicate(
+                    of: currentItem,
+                    restrictedTo: [.uploaded, .uploading, .readyToUpload]
+                ) != nil {
+                    queue.markSkipped(
+                        namespaceID: identity.namespaceID,
+                        uuid: item.workoutUUID,
+                        reason: "Duplicado probable de una actividad ya sincronizada."
+                    )
+                    refreshCounts()
+                    continue
+                }
+
+                let activityLookup = makeActivityLookup(identity.normalizedServerURL, resolvedAPIKey)
+                do {
+                    if try await activityLookup.containsEquivalentActivity(to: currentItem) {
+                        queue.markSkipped(
+                            namespaceID: identity.namespaceID,
+                            uuid: item.workoutUUID,
+                            reason: "skippedExistingServerActivity"
+                        )
+                        refreshCounts()
+                        continue
+                    }
+                } catch EndurainClientError.unauthorizedActivityLookup {
+                    let msg = "La API key necesita permisos de lectura (profile y activities:read) además de activities:upload para evitar duplicados."
+                    AppLog.sync.error("Server duplicate lookup unauthorized")
+                    queue.requeue(namespaceID: identity.namespaceID, uuid: item.workoutUUID, error: msg)
+                    syncState = .error(msg)
+                    lastError = msg
+                    refreshCounts()
+                    return
+                } catch {
+                    let msg = "No se pudo comprobar si la actividad ya existe en Endurain. Se detiene para evitar duplicados."
+                    AppLog.sync.error("Server duplicate lookup failed: \(error.localizedDescription, privacy: .private)")
+                    queue.requeue(namespaceID: identity.namespaceID, uuid: item.workoutUUID, error: msg)
+                    syncState = .error(msg)
+                    lastError = msg
+                    refreshCounts()
+                    return
+                }
+
+                let namespaceTCXDirectoryURL = queue.tcxQueueDirectoryURL
+                    .appendingPathComponent(identity.namespaceID, isDirectory: true)
+                try FileManager.default.createDirectory(at: namespaceTCXDirectoryURL, withIntermediateDirectories: true)
+                let tcxFileURL = namespaceTCXDirectoryURL
                     .appendingPathComponent("\(item.workoutUUID).tcx")
 
                 let tcxData: Data
@@ -251,6 +328,7 @@ final class SyncEngine {
                         if let rejectionReason = savedTCXRejectionReason(tcxString, item: currentItem) {
                             AppLog.sync.info("Skipping queued workout with invalid TCX: \(rejectionReason, privacy: .private)")
                             queue.markSkipped(
+                                namespaceID: identity.namespaceID,
                                 uuid: item.workoutUUID,
                                 reason: rejectionReason
                             )
@@ -261,7 +339,7 @@ final class SyncEngine {
 
                     } else {
                         AppLog.sync.error("Queued TCX file is not valid UTF-8")
-                        queue.markFailed(uuid: item.workoutUUID, error: "TCX guardado no es UTF-8 válido.")
+                        queue.markFailed(namespaceID: identity.namespaceID, uuid: item.workoutUUID, error: "TCX guardado no es UTF-8 válido.")
                         refreshCounts()
                         continue
                     }
@@ -269,13 +347,13 @@ final class SyncEngine {
                     // 1. Recuperar HKWorkout nativo
                     guard let workoutUUID = UUID(uuidString: item.workoutUUID),
                           let workout = try await hkService.fetchHKWorkout(uuid: workoutUUID) else {
-                        queue.markFailed(uuid: item.workoutUUID, error: "No se encontró el entrenamiento en HealthKit.")
+                        queue.markFailed(namespaceID: identity.namespaceID, uuid: item.workoutUUID, error: "No se encontró el entrenamiento en HealthKit.")
                         refreshCounts()
                         continue
                     }
 
                     // 2. Marcar generating
-                    queue.markGenerating(uuid: item.workoutUUID)
+                    queue.markGenerating(namespaceID: identity.namespaceID, uuid: item.workoutUUID)
                     syncState = .generating(name: name)
 
                     // 3a. Leer ruta y pulso completos (awaitable, HealthKit callbacks son thread-safe)
@@ -283,13 +361,14 @@ final class SyncEngine {
                     do {
                         detail = try await hkService.buildWorkoutDetail(for: workout)
                     } catch {
-                        queue.markFailed(uuid: item.workoutUUID, error: error.localizedDescription)
+                        queue.markFailed(namespaceID: identity.namespaceID, uuid: item.workoutUUID, error: error.localizedDescription)
                         refreshCounts()
                         continue
                     }
 
                     if let rejectionReason = routeRejectionReason(for: detail) {
                         queue.markSkipped(
+                            namespaceID: identity.namespaceID,
                             uuid: item.workoutUUID,
                             reason: rejectionReason
                         )
@@ -303,15 +382,15 @@ final class SyncEngine {
                     }.value
 
                     guard let data = tcxString.data(using: .utf8) else {
-                        queue.markFailed(uuid: item.workoutUUID, error: "Error al codificar el TCX.")
+                        queue.markFailed(namespaceID: identity.namespaceID, uuid: item.workoutUUID, error: "Error al codificar el TCX.")
                         refreshCounts()
                         continue
                     }
 
                     // 4. Guardar TCX en Application Support/TCXQueue/<uuid>.tcx
                     try tcxString.write(to: tcxFileURL, atomically: true, encoding: .utf8)
-                    let relativePath = "\(item.workoutUUID).tcx"
-                    queue.markReadyToUpload(uuid: item.workoutUUID, tcxFilePath: relativePath)
+                    let relativePath = identity.namespaceID + "/" + item.workoutUUID + ".tcx"
+                    queue.markReadyToUpload(namespaceID: identity.namespaceID, uuid: item.workoutUUID, tcxFilePath: relativePath)
                     tcxData = data
                 }
 
@@ -319,9 +398,10 @@ final class SyncEngine {
                 syncState = .backgroundUploading(count: uploadAttempts + 1)
 
                 let scheduled = try backgroundUploadService.scheduleUpload(
+                    namespaceID: identity.namespaceID,
                     uuid: item.workoutUUID,
                     tcxFileURL: tcxFileURL,
-                    serverURL: settings.serverURL,
+                    serverURL: identity.normalizedServerURL,
                     apiKey: resolvedAPIKey
                 )
                 if scheduled {
@@ -339,45 +419,48 @@ final class SyncEngine {
                 refreshCounts()
                 // Para 401/403 (API key inválida) — detener la cola, no tiene sentido continuar
                 if case .unauthorized = error {
-                    queue.requeue(uuid: item.workoutUUID, error: msg)
+                    queue.requeue(namespaceID: identity.namespaceID, uuid: item.workoutUUID, error: msg)
                     let authMsg = "API key no autorizada. Revisa la configuración."
                     syncState = .error(authMsg)
                     lastError = authMsg
                     return
                 }
                 if case .duplicate(_) = error {
-                    queue.markUploaded(uuid: item.workoutUUID, serverURL: settings.serverURL)
-                    lastUploadedItem = queue.latestUploaded()
+                    queue.markSkipped(
+                        namespaceID: identity.namespaceID,
+                        uuid: item.workoutUUID,
+                        reason: "skippedExistingServerActivity"
+                    )
                     refreshCounts()
                     continue
                 }
                 if case .rateLimited(_) = error {
-                    queue.requeue(uuid: item.workoutUUID, error: msg)
+                    queue.requeue(namespaceID: identity.namespaceID, uuid: item.workoutUUID, error: msg)
                     syncState = .error("Endurain limitó las peticiones. Espera unos minutos y reintenta.")
                     lastError = msg
                     return
                 }
                 if case .serverError(_, _) = error {
-                    queue.markFailed(uuid: item.workoutUUID, error: msg)
+                    queue.markFailed(namespaceID: identity.namespaceID, uuid: item.workoutUUID, error: msg)
                     syncState = .error("Endurain devolvió un error de servidor. Se ha detenido la sincronización.")
                     lastError = msg
                     return
                 }
-                queue.markFailed(uuid: item.workoutUUID, error: msg)
+                queue.markFailed(namespaceID: identity.namespaceID, uuid: item.workoutUUID, error: msg)
                 refreshCounts()
             } catch {
                 let msg = error.localizedDescription
                 AppLog.sync.error("Unexpected sync error: \(msg, privacy: .private)")
-                queue.markFailed(uuid: item.workoutUUID, error: msg)
+                queue.markFailed(namespaceID: identity.namespaceID, uuid: item.workoutUUID, error: msg)
                 refreshCounts()
             }
         }
 
         // Tras procesar todos: calcular estado final
-        let remainingPending = queue.pendingCount
-        let remainingFailed = queue.failedCount
-        let remainingSkipped = queue.skippedCount
-        let remainingUploading = queue.uploadingCount
+        let remainingPending = queue.pendingCount(namespaceID: identity.namespaceID)
+        let remainingFailed = queue.failedCount(namespaceID: identity.namespaceID)
+        let remainingSkipped = queue.skippedCount(namespaceID: identity.namespaceID)
+        let remainingUploading = queue.uploadingCount(namespaceID: identity.namespaceID)
 
         if remainingUploading > 0 {
             syncState = .backgroundUploading(count: remainingUploading)
@@ -401,33 +484,48 @@ final class SyncEngine {
     // MARK: - Helpers
 
     private func refreshCounts() {
-        pendingCount = queue.pendingCount
-        failedCount = queue.failedCount
-        skippedCount = queue.skippedCount
-        uploadingCount = queue.uploadingCount
+        guard let identity = try? settings.currentIdentity() else {
+            pendingCount = 0
+            failedCount = 0
+            skippedCount = 0
+            uploadingCount = 0
+            lastUploadedItem = nil
+            return
+        }
+        pendingCount = queue.pendingCount(namespaceID: identity.namespaceID)
+        failedCount = queue.failedCount(namespaceID: identity.namespaceID)
+        skippedCount = queue.skippedCount(namespaceID: identity.namespaceID)
+        uploadingCount = queue.uploadingCount(namespaceID: identity.namespaceID)
         if lastUploadedItem == nil {
-            lastUploadedItem = queue.latestUploaded()
+            lastUploadedItem = queue.latestUploaded(namespaceID: identity.namespaceID)
         }
     }
 
     private func refreshIdleStateAfterBackgroundEvent() {
         guard !isSyncInProgress else { return }
-        if queue.uploadingCount > 0 {
-            syncState = .backgroundUploading(count: queue.uploadingCount)
-        } else if queue.pendingCount > 0 {
+        guard let identity = try? settings.currentIdentity() else {
             syncState = .idle
-            lastError = "Quedan \(queue.pendingCount) entrenamiento(s) pendientes. La app continuará automáticamente."
-        } else if queue.failedCount > 0 {
-            syncState = .error("\(queue.failedCount) entrenamiento(s) no se pudieron subir.")
+            refreshCounts()
+            return
+        }
+        if queue.uploadingCount(namespaceID: identity.namespaceID) > 0 {
+            syncState = .backgroundUploading(count: queue.uploadingCount(namespaceID: identity.namespaceID))
+        } else if queue.pendingCount(namespaceID: identity.namespaceID) > 0 {
+            syncState = .idle
+            lastError = "Quedan \(queue.pendingCount(namespaceID: identity.namespaceID)) entrenamiento(s) pendientes. La app continuará automáticamente."
+        } else if queue.failedCount(namespaceID: identity.namespaceID) > 0 {
+            syncState = .error("\(queue.failedCount(namespaceID: identity.namespaceID)) entrenamiento(s) no se pudieron subir.")
         } else {
             syncState = .synced
-            lastUploadedItem = queue.latestUploaded()
+            lastUploadedItem = queue.latestUploaded(namespaceID: identity.namespaceID)
         }
     }
 
     private func scheduleAutomaticContinuationIfNeeded() {
         guard !isSyncInProgress else { return }
-        guard queue.uploadingCount == 0, queue.pendingCount > 0 else { return }
+        guard let identity = try? settings.currentIdentity() else { return }
+        guard queue.uploadingCount(namespaceID: identity.namespaceID) == 0,
+              queue.pendingCount(namespaceID: identity.namespaceID) > 0 else { return }
         guard automaticContinuationTask == nil else { return }
 
         automaticContinuationTask = Task { @MainActor [weak self] in
@@ -437,9 +535,9 @@ final class SyncEngine {
         }
     }
 
-    private func requeueFailedItemsForRetry() {
-        for failed in queue.failedItems() {
-            queue.requeue(uuid: failed.workoutUUID, error: failed.lastError)
+    private func requeueFailedItemsForRetry(namespaceID: String) {
+        for failed in queue.failedItems(namespaceID: namespaceID) {
+            queue.requeue(namespaceID: namespaceID, uuid: failed.workoutUUID, error: failed.lastError)
         }
         refreshCounts()
     }

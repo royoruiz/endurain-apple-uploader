@@ -8,10 +8,11 @@ App iOS que lee entrenamientos de Apple Salud y los sube a una instancia self-ho
 
 1. Abre la app.
 2. Introduce la URL de tu servidor Endurain. Si no indicas esquema, la app usará `https://`.
-3. Introduce tu API key de Endurain.
-4. Pulsa **Guardar**.
-5. En la pantalla principal, pulsa **Dar permiso a Apple Salud** y acepta los permisos de lectura.
-6. La app comenzará a sincronizar automáticamente.
+3. Introduce el usuario/cuenta de Endurain. Se usa como namespace local de deduplicación.
+4. Introduce tu API key de Endurain.
+5. Pulsa **Guardar**.
+6. En la pantalla principal, pulsa **Dar permiso a Apple Salud** y acepta los permisos de lectura.
+7. La app comenzará a sincronizar automáticamente.
 
 ---
 
@@ -21,7 +22,7 @@ App iOS que lee entrenamientos de Apple Salud y los sube a una instancia self-ho
 
 - **Escaneo completo**: al abrir la app, escanea todos los entrenamientos de Apple Salud desde el año 2000.
 - **Cola persistente**: guarda el estado en `Application Support/EndurainAppleUploader/sync-queue.json`.
-- **Deduplicación**: nunca sube dos veces el mismo entrenamiento (clave: `HKWorkout.uuid`).
+- **Deduplicación**: nunca sube dos veces el mismo entrenamiento para el mismo servidor+usuario (clave: `SHA256(servidor_normalizado + "\n" + usuario_normalizado) + HKWorkout.uuid`).
 - **Generación TCX**: lee ruta GPS y frecuencia cardíaca, genera un fichero TCX estándar (Garmin Training Center XML).
 - **Omisión segura**: los entrenamientos sin al menos dos puntos GPS se marcan como omitidos. Endurain no importa correctamente TCX sin trackpoints.
 - **Subida en background**: usa `URLSessionConfiguration.background` y `uploadTask(fromFile:)`. El multipart completo se escribe a disco antes de programar la tarea.
@@ -47,7 +48,7 @@ App iOS que lee entrenamientos de Apple Salud y los sube a una instancia self-ho
 - **iOS decide cuándo ejecutar**: HealthKit background delivery y URLSession background son best-effort.
 - **No hay ejecución infinita**: si iOS suspende la app, las subidas ya programadas pueden continuar, pero no se garantiza procesamiento ilimitado.
 - **Force quit**: si el usuario fuerza el cierre desde el app switcher, iOS puede no despertar la app hasta la próxima apertura manual.
-- **Reanudación al abrir**: la app siempre reconcilia tareas URLSession, reescanea HealthKit y continúa sin duplicar por `HKWorkout.uuid`.
+- **Reanudación al abrir**: la app siempre reconcilia tareas URLSession, reescanea HealthKit y continúa sin duplicar por servidor+usuario+`HKWorkout.uuid`.
 - **Sin paginación**: si tienes miles de entrenamientos, el escaneo inicial puede tardar varios segundos.
 - **Lote limitado**: para proteger Endurain, la app programa como máximo 10 subidas por lote y lanza el siguiente lote automáticamente cuando termina el anterior.
 - **Sin ruta GPS, no TCX**: actividades indoor o entrenos sin ruta se omiten en esta fase.
@@ -59,12 +60,12 @@ App iOS que lee entrenamientos de Apple Salud y los sube a una instancia self-ho
 - Capability `HealthKit` debe estar activa.
 - Entitlement `com.apple.developer.healthkit.background-delivery` debe estar presente.
 - No se usa `BGTaskScheduler` en esta fase.
-- No hace falta guardar la API key fuera de Keychain.
+- No hace falta guardar la API key fuera de Keychain. La API key es credencial, no identidad, y no participa en la deduplicación.
 
 ## Cómo Probar
 
 1. Ejecuta la app en un iPhone real.
-2. Configura el servidor Endurain del usuario.
+2. Configura el servidor Endurain y el usuario/cuenta Endurain.
 3. Crea una API key con scope `activities:upload`.
 4. Concede permisos de lectura de Apple Salud.
 5. Crea un entreno corto con ruta GPS.
@@ -76,6 +77,19 @@ App iOS que lee entrenamientos de Apple Salud y los sube a una instancia self-ho
 11. Confirma que no duplica entrenamientos ya subidos.
 12. Bloquea el iPhone durante una subida larga.
 13. Reabre la app y confirma que reanuda o queda sincronizado.
+
+### Reset configuration behavior
+
+1. Configura un servidor Endurain A y usuario `nicolas`.
+2. Sube entrenamientos.
+3. Pulsa **Borrar configuración**.
+4. Deja sin marcar **Also delete upload history for this server/user**.
+5. Reconfigura el mismo servidor A y usuario `nicolas` con otra API key.
+6. La app no debe volver a subir entrenamientos ya registrados localmente para ese servidor+usuario.
+7. Si quieres tratar el mismo servidor+usuario como fresco porque has recreado la base de datos Endurain, repite el borrado marcando **Also delete upload history for this server/user**.
+8. Con esa casilla marcada, la app borra solo el historial de ese namespace y podrá volver a subir los entrenamientos al reconfigurar el mismo servidor+usuario.
+9. Cambiar de servidor o cambiar de usuario crea otro namespace, así que los mismos entrenamientos son elegibles para ese destino.
+10. Los permisos de HealthKit deben seguir concedidos salvo que se revoquen desde Ajustes de iOS.
 
 ---
 
@@ -127,7 +141,8 @@ Si `iPhone 16` no existe en tu Xcode, cambia el destino por un simulador disponi
 ```
 Application Support/EndurainAppleUploader/
 ├── sync-queue.json          ← cola persistente de sincronización
-└── TCXQueue/                ← ficheros TCX temporales durante generación
+├── TCXQueue/<namespace>/    ← ficheros TCX temporales durante generación
+└── MultipartUploads/<namespace>/ ← ficheros multipart temporales para URLSession background
 ```
 
 ---
