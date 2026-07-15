@@ -345,9 +345,11 @@ final class SyncEngine {
                     }
 
                     // 3b. Generar XML TCX en Task.detached (puro, sin estado de UI, puede ser costoso)
-                    let tcxString: String = await Task.detached(priority: .userInitiated) {
-                        TCXGenerator.generate(from: detail)
-                    }.value
+                    let tcxString: String = await {
+                        await Task.detached(priority: .userInitiated) {
+                            await TCXGenerator.generate(from: detail)
+                        }.value
+                    }()
 
                     guard let data = tcxString.data(using: .utf8) else {
                         queue.markFailed(namespaceID: identity.namespaceID, uuid: item.workoutUUID, error: "Error al codificar el TCX.")

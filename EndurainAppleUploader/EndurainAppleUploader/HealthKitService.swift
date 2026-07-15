@@ -171,7 +171,7 @@ final class HealthKitService {
                     endDate: first.endDate,
                     durationSeconds: first.duration,
                     totalDistanceMeters: first.totalDistance?.doubleValue(for: .meter()),
-                    activeEnergyKcal: first.totalEnergyBurned?.doubleValue(for: .kilocalorie())
+                    activeEnergyKcal: activeEnergyKcal(first)
                 )
                 // Query ligera ruta/pulso solo para el primero
                 async let hasRoute = checkHasRoute(for: first)
@@ -290,7 +290,7 @@ final class HealthKitService {
                 endDate: workout.endDate,
                 durationSeconds: workout.duration,
                 totalDistanceMeters: workout.totalDistance?.doubleValue(for: .meter()),
-                activeEnergyKcal: workout.totalEnergyBurned?.doubleValue(for: .kilocalorie()),
+                activeEnergyKcal: activeEnergyKcal(workout),
                 routePoints: points,
                 heartRateSamples: hrSamples
             )
@@ -406,11 +406,11 @@ final class HealthKitService {
                     activityTypeName: workout.workoutActivityType.displayName,
                     startDate: workout.startDate,
                     endDate: workout.endDate,
-                    durationSeconds: workout.duration,
-                    totalDistanceMeters: workout.totalDistance?.doubleValue(for: .meter()),
-                    activeEnergyKcal: workout.totalEnergyBurned?.doubleValue(for: .kilocalorie())
-                )
-                async let hasRoute = checkHasRoute(for: workout)
+                durationSeconds: workout.duration,
+                totalDistanceMeters: workout.totalDistance?.doubleValue(for: .meter()),
+                activeEnergyKcal: activeEnergyKcal(workout)
+            )
+            async let hasRoute = checkHasRoute(for: workout)
                 async let hasHR = checkHasHeartRate(for: workout)
                 let (route, hr) = await (hasRoute, hasHR)
                 latestWorkoutHasRoute = route
@@ -469,7 +469,7 @@ final class HealthKitService {
             endDate: workout.endDate,
             durationSeconds: workout.duration,
             totalDistanceMeters: workout.totalDistance?.doubleValue(for: .meter()),
-            activeEnergyKcal: workout.totalEnergyBurned?.doubleValue(for: .kilocalorie()),
+            activeEnergyKcal: activeEnergyKcal(workout),
             routePoints: points,
             heartRateSamples: samples
         )
@@ -518,6 +518,16 @@ final class HealthKitService {
             }
             store.execute(query)
         }
+    }
+
+    private func activeEnergyKcal(_ workout: HKWorkout) -> Double? {
+        guard let activeEnergyType = HKQuantityType.quantityType(forIdentifier: .activeEnergyBurned) else {
+            return nil
+        }
+        return workout
+            .statistics(for: activeEnergyType)?
+            .sumQuantity()?
+            .doubleValue(for: .kilocalorie())
     }
 
     // MARK: - Fetch Heart Rate
