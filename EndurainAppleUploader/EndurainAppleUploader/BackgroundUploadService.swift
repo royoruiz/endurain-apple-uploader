@@ -13,7 +13,6 @@ final class BackgroundUploadService: NSObject, @preconcurrency URLSessionTaskDel
 
     static let sessionIdentifier = "es.overtus.endurainsync.upload"
 
-    private static let uploadPath = "/api/v1/activities/create/upload"
     private static let multipartSubdir = SyncQueueStore.multipartSubdir
 
     private let queue: SyncQueueStore
@@ -59,18 +58,17 @@ final class BackgroundUploadService: NSObject, @preconcurrency URLSessionTaskDel
         serverURL: String,
         apiKey: String
     ) throws -> Bool {
-        if let existing = queue.item(namespaceID: namespaceID, uuid: uuid), existing.status == .uploading {
+        if let existing = queue.item(namespaceID: namespaceID, uuid: uuid),
+           existing.status == .uploading || existing.importJobID != nil {
             AppLog.upload.info("Skipping already active background upload for workout \(uuid, privacy: .private), task \(existing.backgroundTaskIdentifier ?? -1)")
             return false
         }
 
-        let trimmedServer = serverURL.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard let url = URL(string: trimmedServer + Self.uploadPath) else {
-            throw EndurainClientError.invalidURL
-        }
-
         let filename = "apple-health-\(uuid.lowercased()).tcx"
         let boundary = "Boundary-\(UUID().uuidString)"
+        let request = try ActivityIngestionAPI.uploadRequest(
+            serverURL: serverURL, apiKey: apiKey, filename: filename, boundary: boundary
+        )
         let multipartFileURL = try writeMultipartFile(
             tcxFileURL: tcxFileURL,
             filename: filename,
@@ -79,20 +77,23 @@ final class BackgroundUploadService: NSObject, @preconcurrency URLSessionTaskDel
             uuid: uuid
         )
 
-        var request = URLRequest(url: url)
-        request.httpMethod = "POST"
-        request.setValue("multipart/form-data; boundary=\(boundary)", forHTTPHeaderField: "Content-Type")
-        request.setValue(apiKey, forHTTPHeaderField: "X-API-Key")
-        request.timeoutInterval = 60
-
+        let receipts = queue.ingestionReceipts
+        guard !receipts.exists(scope: namespaceID, filename: filename) else {
+            throw EndurainClientError.importStateUnavailable
+        }
+        try receipts.record(jobID: nil, scope: namespaceID, filename: filename)
         let task = session.uploadTask(with: request, fromFile: multipartFileURL)
         let relativeMultipartPath = Self.multipartSubdir + "/" + namespaceID + "/" + multipartFileURL.lastPathComponent
-        queue.markUploading(
+        guard queue.markUploading(
             namespaceID: namespaceID,
             uuid: uuid,
             taskIdentifier: task.taskIdentifier,
             multipartFilePath: relativeMultipartPath
-        )
+        ) else {
+            task.cancel()
+            try? receipts.remove(scope: namespaceID, filename: filename)
+            throw EndurainClientError.importStateUnavailable
+        }
 
         AppLog.upload.info("Scheduled background upload task \(task.taskIdentifier) for workout \(uuid, privacy: .private)")
         task.resume()
@@ -153,17 +154,37 @@ final class BackgroundUploadService: NSObject, @preconcurrency URLSessionTaskDel
         }
 
         if let error {
+            discardUploadIntent(item, namespaceID: namespaceID)
             AppLog.upload.error("Background upload task \(taskID) failed: \(error.localizedDescription, privacy: .private)")
             queue.requeue(namespaceID: namespaceID, uuid: item.workoutUUID, error: "Error de red en background upload: \(error.localizedDescription)")
             return
         }
 
         guard let statusCode else {
+            discardUploadIntent(item, namespaceID: namespaceID)
             AppLog.upload.error("Background upload task \(taskID) completed without HTTP response")
             queue.requeue(namespaceID: namespaceID, uuid: item.workoutUUID, error: "Respuesta HTTP ausente en background upload.")
             return
         }
 
+        if statusCode == 202 {
+            do {
+                let job = try ActivityIngestionAPI.decodeJob(bodyData)
+                guard queue.markImportAccepted(namespaceID: namespaceID, uuid: item.workoutUUID, jobID: job.id) else {
+                    throw EndurainClientError.importStateUnavailable
+                }
+                queue.applyIngestionJob(job, namespaceID: namespaceID, uuid: item.workoutUUID)
+            } catch EndurainClientError.importStateUnavailable {
+                queue.markFailed(namespaceID: namespaceID, uuid: item.workoutUUID,
+                                 error: EndurainClientError.importStateUnavailable.localizedDescription)
+            } catch {
+                queue.markFailed(namespaceID: namespaceID, uuid: item.workoutUUID,
+                                 error: "Invalid import acknowledgement. The TCX has been retained for an idempotent retry.")
+            }
+            return
+        }
+
+        discardUploadIntent(item, namespaceID: namespaceID)
         switch UploadStatusMapper.map(statusCode: statusCode, bodySummary: bodySummary) {
         case .success:
             queue.markUploaded(namespaceID: namespaceID, uuid: item.workoutUUID, serverURL: item.normalizedServerURL ?? item.serverURL ?? "")
@@ -188,6 +209,11 @@ final class BackgroundUploadService: NSObject, @preconcurrency URLSessionTaskDel
     }
 
     // MARK: - Private
+
+    private func discardUploadIntent(_ item: SyncQueueItem, namespaceID: String) {
+        try? queue.ingestionReceipts.remove(
+            scope: namespaceID, filename: "apple-health-\(item.workoutUUID.lowercased()).tcx")
+    }
 
     private func writeMultipartFile(
         tcxFileURL: URL,

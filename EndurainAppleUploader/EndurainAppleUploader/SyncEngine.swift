@@ -140,7 +140,13 @@ final class SyncEngine {
     func syncAutomatically(scanHealthKit: Bool = true) async {
         guard !isSyncInProgress else { return }
         isSyncInProgress = true
-        defer { isSyncInProgress = false }
+        defer {
+            isSyncInProgress = false
+            if let identity = try? settings.currentIdentity(),
+               !queue.importingItems(namespaceID: identity.namespaceID).isEmpty {
+                scheduleAutomaticContinuationIfNeeded()
+            }
+        }
 
         lastError = nil
 
@@ -156,8 +162,27 @@ final class SyncEngine {
             return
         }
 
+        if !queue.importingItems(namespaceID: identity.namespaceID).isEmpty {
+            do {
+                guard let apiKey = try settings.readAPIKey(), !apiKey.isEmpty else {
+                    throw EndurainClientError.unauthorized
+                }
+                await ActivityImportMonitor(queue: queue).refresh(
+                    namespaceID: identity.namespaceID, serverURL: identity.normalizedServerURL, apiKey: apiKey
+                )
+                refreshCounts()
+            } catch {
+                lastError = "Unable to check accepted imports. Review the API key configuration."
+            }
+        }
+
         if queue.uploadingCount(namespaceID: identity.namespaceID) > 0 {
-            syncState = .backgroundUploading(count: queue.uploadingCount(namespaceID: identity.namespaceID))
+            if let error = queue.unconfirmedUploadError(namespaceID: identity.namespaceID) {
+                syncState = .error(error)
+                lastError = error
+            } else {
+                syncState = .backgroundUploading(count: queue.uploadingCount(namespaceID: identity.namespaceID))
+            }
             return
         }
 
@@ -175,8 +200,13 @@ final class SyncEngine {
 
         let pending = queue.pendingItems(namespaceID: identity.namespaceID)
         guard !pending.isEmpty else {
-            syncState = .synced
             refreshCounts()
+            if failedCount > 0 {
+                syncState = .error("An activity could not be imported.")
+                lastError = queue.failedItems(namespaceID: identity.namespaceID).first?.lastError
+            } else {
+                syncState = .synced
+            }
             return
         }
 
@@ -364,7 +394,7 @@ final class SyncEngine {
                     tcxData = data
                 }
 
-                // 5. Programar subida background. El delegate confirmará uploaded tras HTTP 2xx.
+                // Completion is confirmed only after the accepted import job succeeds.
                 syncState = .backgroundUploading(count: uploadAttempts + 1)
 
                 let scheduled = try backgroundUploadService.scheduleUpload(
@@ -466,6 +496,9 @@ final class SyncEngine {
         failedCount = queue.failedCount(namespaceID: identity.namespaceID)
         skippedCount = queue.skippedCount(namespaceID: identity.namespaceID)
         uploadingCount = queue.uploadingCount(namespaceID: identity.namespaceID)
+        if let importError = queue.importingItems(namespaceID: identity.namespaceID).compactMap(\.lastError).first {
+            lastError = importError
+        }
         if lastUploadedItem == nil {
             lastUploadedItem = queue.latestUploaded(namespaceID: identity.namespaceID)
         }
@@ -494,19 +527,22 @@ final class SyncEngine {
     private func scheduleAutomaticContinuationIfNeeded() {
         guard !isSyncInProgress else { return }
         guard let identity = try? settings.currentIdentity() else { return }
-        guard queue.uploadingCount(namespaceID: identity.namespaceID) == 0,
-              queue.pendingCount(namespaceID: identity.namespaceID) > 0 else { return }
+        let hasImports = !queue.importingItems(namespaceID: identity.namespaceID).isEmpty
+        guard hasImports || (queue.uploadingCount(namespaceID: identity.namespaceID) == 0
+                             && queue.pendingCount(namespaceID: identity.namespaceID) > 0) else { return }
         guard automaticContinuationTask == nil else { return }
 
         automaticContinuationTask = Task { @MainActor [weak self] in
-            try? await Task.sleep(nanoseconds: 1_500_000_000)
+            do {
+                try await Task.sleep(nanoseconds: hasImports ? 5_000_000_000 : 1_500_000_000)
+            } catch { return }
             self?.automaticContinuationTask = nil
             await self?.syncAutomatically(scanHealthKit: false)
         }
     }
 
     private func requeueFailedItemsForRetry(namespaceID: String) {
-        for failed in queue.failedItems(namespaceID: namespaceID) {
+        for failed in queue.failedItems(namespaceID: namespaceID) where failed.importJobID == nil {
             queue.requeue(namespaceID: namespaceID, uuid: failed.workoutUUID, error: failed.lastError)
         }
         refreshCounts()

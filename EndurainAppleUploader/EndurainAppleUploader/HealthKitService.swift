@@ -322,7 +322,8 @@ final class HealthKitService {
 
             // 4. Subir a Endurain
             uploadStep = .uploading
-            let client = EndurainClient(serverURL: settings.serverURL, apiKey: resolvedAPIKey)
+            let client = EndurainClient(serverURL: settings.serverURL, apiKey: resolvedAPIKey,
+                                        namespaceID: try settings.currentIdentity().namespaceID)
             _ = try await client.uploadActivityTCX(tcxData: tcxData, filename: filename)
 
             // 5. Guardar estado local

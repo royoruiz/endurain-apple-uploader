@@ -97,9 +97,20 @@ App iOS que lee entrenamientos de Apple Salud y los sube a una instancia self-ho
 
 - Endurain API keys para esta app solo requieren `activities:upload`.
 - La app no usa `profile:read`, `activities:read`, `/api/v1/user/me`, `/api/v1/profile` ni endpoints de listado de actividades.
-- La prevención de duplicados es local y está acotada por servidor normalizado + usuario normalizado + `HKWorkout.uuid`.
+- Duplicate prevention combines local server/user/workout identity with Endurain's idempotency-key replay contract.
 - Si solo rotas la API key para el mismo servidor y usuario, no borres el historial de subidas.
 - Si recreas o vacías la base de datos de Endurain manteniendo el mismo servidor y usuario, la app no puede detectarlo desde la API. Para subir todo otra vez, borra la configuración marcando **Also delete upload history for this server/user**.
+
+### Endurain v0.20.2 imports
+
+- Uploads use `POST /api/v1/activities/upload`, multipart field `file`, and `X-API-Key`.
+- A stable `Idempotency-Key` derived from the workout filename is reused after lost responses and restarts. Endurain scopes replay keys to the caller.
+- HTTP 202 means **accepted**, not synchronized. The background queue saves the job ID and checks `GET /api/v1/activities/ingestion-jobs/{job_id}` using the same `activities:upload` permission.
+- The TCX is retained until the job reports `completed` with an activity ID. Accepted jobs resume through GET, not another upload.
+- Both upload paths retain a minimal write-ahead receipt containing only the job handle. A failed queue-snapshot write cannot silently make an accepted import eligible for another POST. If local receipt storage cannot be confirmed, automatic reposting stops with an explicit error.
+- A terminal import failure keeps the TCX and job ID for diagnosis; it is not automatically reposted. A temporary status-query failure keeps the accepted job pending.
+- Existing uploaded/skipped history is preserved. No HealthKit distance samples or original workouts are modified.
+- The legacy foreground path also waits for job completion. If its bounded wait or a GET fails, a recreated client resumes the saved job through GET rather than repeating POST.
 
 ---
 
@@ -123,6 +134,24 @@ App iOS que lee entrenamientos de Apple Salud y los sube a una instancia self-ho
 ---
 
 ## Comandos De Validación
+
+### Hostless upload tests (no application launch or installation)
+
+The dependency-free Swift package compiles only the upload core. HTTP fixtures
+intercept every request; these tests do not access HealthKit, Keychain, devices,
+or a real Endurain server.
+
+```bash
+SCRATCH=$(mktemp -d)
+mkdir -p "$SCRATCH"/{home,tmp,cache,config,security}
+HOME="$SCRATCH/home" TMPDIR="$SCRATCH/tmp" swift test \
+  --scratch-path "$SCRATCH/build" --cache-path "$SCRATCH/cache" \
+  --config-path "$SCRATCH/config" --security-path "$SCRATCH/security"
+# Remove your temporary SCRATCH directory after inspecting the results.
+```
+
+The Xcode test target below is app-hosted and may start synchronization. Do not
+run it against a configured application during read-only diagnosis.
 
 Listar schemes:
 
@@ -152,6 +181,7 @@ Si `iPhone 16` no existe en tu Xcode, cambia el destino por un simulador disponi
 Application Support/EndurainAppleUploader/
 ├── sync-queue.json          ← cola persistente de sincronización
 ├── TCXQueue/<namespace>/    ← ficheros TCX temporales durante generación
+├── IngestionReceipts/      ← opaque import handles and unresolved submission intents
 └── MultipartUploads/<namespace>/ ← ficheros multipart temporales para URLSession background
 ```
 

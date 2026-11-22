@@ -48,6 +48,7 @@ struct SyncQueueItem: Codable, Identifiable {
     var multipartFilePath: String?
     var uploadStartedAt: Date?
     var createdAt: Date
+    var importJobID: String? = nil
 
     var id: String { (namespaceID ?? "legacy") + ":" + workoutUUID }
 
@@ -76,6 +77,9 @@ final class SyncQueueStore {
     private let queueFileURL: URL
     let tcxQueueDirectoryURL: URL
     let storageDirectoryURL: URL
+    var ingestionReceipts: IngestionReceiptStore {
+        IngestionReceiptStore(directoryURL: storageDirectoryURL.appendingPathComponent("IngestionReceipts"))
+    }
 
     // MARK: - State (acceso serializado por un actor interno)
 
@@ -132,6 +136,7 @@ final class SyncQueueStore {
         do {
             let data = try Data(contentsOf: queueFileURL)
             items = try decoder.decode([SyncQueueItem].self, from: data)
+            restoreImportReceipts()
         } catch {
             AppLog.queue.error("Failed to load sync queue: \(error.localizedDescription, privacy: .private)")
             items = []
@@ -140,7 +145,8 @@ final class SyncQueueStore {
 
     // MARK: - Save (escritura atómica)
 
-    func save() {
+    @discardableResult
+    func save() -> Bool {
         do {
             let data = try encoder.encode(items)
             // Escribir a fichero temporal en el mismo directorio
@@ -152,8 +158,10 @@ final class SyncQueueStore {
             } else {
                 try FileManager.default.moveItem(at: tempURL, to: queueFileURL)
             }
+            return true
         } catch {
             AppLog.queue.error("Failed to save sync queue: \(error.localizedDescription, privacy: .private)")
+            return false
         }
     }
 
@@ -164,9 +172,11 @@ final class SyncQueueStore {
         try deleteStorageFile()
         try clearDirectoryContents(tcxQueueDirectoryURL)
         try clearDirectoryContents(storageDirectoryURL.appendingPathComponent(Self.multipartSubdir, isDirectory: true))
+        try clearDirectoryContents(ingestionReceipts.directoryURL)
     }
 
     func deleteHistory(namespaceID: String) throws {
+        try ingestionReceipts.removeScope(namespaceID)
         let removed = items.filter { $0.namespaceID == namespaceID }
         items.removeAll { $0.namespaceID == namespaceID }
         save()
@@ -301,7 +311,8 @@ final class SyncQueueStore {
         }
     }
 
-    func markUploading(namespaceID: String, uuid: String, taskIdentifier: Int? = nil, multipartFilePath: String? = nil) {
+    @discardableResult
+    func markUploading(namespaceID: String, uuid: String, taskIdentifier: Int? = nil, multipartFilePath: String? = nil) -> Bool {
         mutate(namespaceID: namespaceID, uuid: uuid) {
             $0.status = .uploading
             $0.backgroundTaskIdentifier = taskIdentifier
@@ -310,8 +321,9 @@ final class SyncQueueStore {
         }
     }
 
-    func markUploaded(namespaceID: String, uuid: String, serverURL: String) {
-        mutate(namespaceID: namespaceID, uuid: uuid) {
+    @discardableResult
+    func markUploaded(namespaceID: String, uuid: String, serverURL: String) -> Bool {
+        let saved = mutate(namespaceID: namespaceID, uuid: uuid) {
             $0.status = .uploaded
             $0.uploadedAt = Date()
             $0.serverURL = serverURL
@@ -320,6 +332,8 @@ final class SyncQueueStore {
             $0.multipartFilePath = nil
             $0.uploadStartedAt = nil
         }
+        if saved { try? ingestionReceipts.remove(scope: namespaceID, filename: uploadFilename(uuid)) }
+        return saved
     }
 
     func markSkipped(namespaceID: String, uuid: String, reason: String) {
@@ -343,6 +357,8 @@ final class SyncQueueStore {
 
     func requeue(namespaceID: String, uuid: String, error: String? = nil) {
         mutate(namespaceID: namespaceID, uuid: uuid) {
+            guard $0.importJobID == nil,
+                  !ingestionReceipts.exists(scope: namespaceID, filename: uploadFilename(uuid)) else { return }
             $0.status = $0.tcxFilePath == nil ? .queued : .readyToUpload
             $0.lastError = error
             $0.backgroundTaskIdentifier = nil
@@ -354,7 +370,8 @@ final class SyncQueueStore {
     // Re-encola un item failed para volver a intentarlo
     func requeueFailed(namespaceID: String, uuid: String) {
         mutate(namespaceID: namespaceID, uuid: uuid) {
-            guard $0.status == .failed else { return }
+            guard $0.status == .failed, $0.importJobID == nil,
+                  !ingestionReceipts.exists(scope: namespaceID, filename: uploadFilename(uuid)) else { return }
             $0.status = .queued
             $0.lastError = nil
         }
@@ -362,8 +379,73 @@ final class SyncQueueStore {
 
     // MARK: - Queries
 
+    @discardableResult
+    func markImportAccepted(namespaceID: String, uuid: String, jobID: String) -> Bool {
+        do {
+            try ingestionReceipts.record(jobID: jobID, scope: namespaceID, filename: uploadFilename(uuid))
+        } catch {
+            return false
+        }
+        mutate(namespaceID: namespaceID, uuid: uuid) {
+            $0.importJobID = jobID
+            $0.status = .uploading
+            $0.lastError = nil
+            $0.backgroundTaskIdentifier = nil
+            $0.multipartFilePath = nil
+            $0.uploadStartedAt = nil
+        }
+        // The receipt remains durable even when the queue snapshot cannot save.
+        return true
+    }
+
+    func importingItems(namespaceID: String) -> [SyncQueueItem] {
+        restoreImportReceipts()
+        return items.filter { $0.namespaceID == namespaceID && $0.status == .uploading && $0.importJobID != nil }
+    }
+
+    func unconfirmedUploadError(namespaceID: String) -> String? {
+        restoreImportReceipts()
+        return items.first {
+            $0.namespaceID == namespaceID && $0.status == .uploading
+                && $0.importJobID == nil && $0.backgroundTaskIdentifier == nil
+                && ingestionReceipts.exists(scope: namespaceID, filename: uploadFilename($0.workoutUUID))
+        }?.lastError
+    }
+
+    func recordImportPollError(namespaceID: String, uuid: String, error: String) {
+        mutate(namespaceID: namespaceID, uuid: uuid) {
+            guard $0.importJobID != nil, $0.status == .uploading else { return }
+            $0.lastError = error
+        }
+    }
+
+    func applyIngestionJob(_ job: ActivityIngestionJob, namespaceID: String, uuid: String) {
+        guard let item = item(namespaceID: namespaceID, uuid: uuid),
+              item.status == .uploading, item.importJobID == job.id else { return }
+        switch job.status {
+        case .pending, .processing:
+            mutate(namespaceID: namespaceID, uuid: uuid) { $0.lastError = nil }
+        case .failed:
+            markFailed(namespaceID: namespaceID, uuid: uuid,
+                       error: "Endurain import failed (\(job.failureCode)). The TCX and job identifier have been retained.")
+        case .completed:
+            guard job.confirmsActivity else {
+                markFailed(namespaceID: namespaceID, uuid: uuid,
+                           error: "Import completed without an activity identifier. The TCX has been retained.")
+                return
+            }
+            if markUploaded(namespaceID: namespaceID, uuid: uuid,
+                            serverURL: item.normalizedServerURL ?? item.serverURL ?? ""),
+               let path = item.tcxFilePath {
+                try? FileManager.default.removeItem(at: tcxQueueDirectoryURL.appendingPathComponent(path))
+            }
+        }
+    }
+
     func pendingItems(namespaceID: String) -> [SyncQueueItem] {
-        items.filter { $0.namespaceID == namespaceID && ($0.status == .queued || $0.status == .readyToUpload) }
+        items.filter { $0.namespaceID == namespaceID && $0.importJobID == nil
+            && !ingestionReceipts.exists(scope: namespaceID, filename: uploadFilename($0.workoutUUID))
+            && ($0.status == .queued || $0.status == .readyToUpload) }
             .sorted { $0.startDate < $1.startDate }
     }
 
@@ -446,12 +528,24 @@ final class SyncQueueStore {
     }
 
     func reconcileUploadingItems(activeTaskIdentifiers: Set<Int>, staleAfter seconds: TimeInterval = 30 * 60) {
+        restoreImportReceipts()
         var changed = false
         let now = Date()
         for i in items.indices {
-            guard items[i].status == .uploading else { continue }
+            guard items[i].status == .uploading, items[i].importJobID == nil else { continue }
             if let uploadStartedAt = items[i].uploadStartedAt,
                now.timeIntervalSince(uploadStartedAt) < seconds {
+                continue
+            }
+            if let namespace = items[i].namespaceID,
+               ingestionReceipts.exists(scope: namespace, filename: uploadFilename(items[i].workoutUUID)) {
+                if let taskID = items[i].backgroundTaskIdentifier, activeTaskIdentifiers.contains(taskID) {
+                    continue
+                }
+                // An unresolved durable intent must not silently become another POST.
+                items[i].backgroundTaskIdentifier = nil
+                items[i].lastError = EndurainClientError.importStateUnavailable.localizedDescription
+                changed = true
                 continue
             }
             guard let taskID = items[i].backgroundTaskIdentifier else {
@@ -472,7 +566,7 @@ final class SyncQueueStore {
     }
 
     func pendingCount(namespaceID: String) -> Int {
-        items.filter { $0.namespaceID == namespaceID && ($0.status == .queued || $0.status == .readyToUpload) }.count
+        pendingItems(namespaceID: namespaceID).count
     }
 
     func failedCount(namespaceID: String) -> Int {
@@ -506,10 +600,32 @@ final class SyncQueueStore {
 
     // MARK: - Private
 
-    private func mutate(namespaceID: String, uuid: String, transform: (inout SyncQueueItem) -> Void) {
-        guard let idx = items.firstIndex(where: { $0.namespaceID == namespaceID && $0.workoutUUID == uuid }) else { return }
+    private func uploadFilename(_ uuid: String) -> String { "apple-health-\(uuid.lowercased()).tcx" }
+
+    private func restoreImportReceipts() {
+        for i in items.indices {
+            guard items[i].status != .uploaded, items[i].status != .skipped,
+                  items[i].importJobID == nil, let namespace = items[i].namespaceID else { continue }
+            let filename = uploadFilename(items[i].workoutUUID)
+            guard ingestionReceipts.exists(scope: namespace, filename: filename) else { continue }
+            if let jobID = try? ingestionReceipts.jobID(scope: namespace, filename: filename) {
+                items[i].importJobID = jobID
+                items[i].status = .uploading
+                items[i].backgroundTaskIdentifier = nil
+                items[i].multipartFilePath = nil
+                items[i].uploadStartedAt = nil
+            } else if items[i].status != .failed {
+                items[i].status = .uploading
+                items[i].lastError = EndurainClientError.importStateUnavailable.localizedDescription
+            }
+        }
+    }
+
+    @discardableResult
+    private func mutate(namespaceID: String, uuid: String, transform: (inout SyncQueueItem) -> Void) -> Bool {
+        guard let idx = items.firstIndex(where: { $0.namespaceID == namespaceID && $0.workoutUUID == uuid }) else { return false }
         transform(&items[idx])
-        save()
+        return save()
     }
 
     private func removeDirectoryIfEmpty(_ directoryURL: URL) throws {

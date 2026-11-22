@@ -666,7 +666,7 @@ final class EndurainClientTests: XCTestCase {
     func testUploadUsesXAPIKeyOnly() async throws {
         let session = makeMockSession()
         MockURLProtocol.handler = { request in
-            XCTAssertEqual(request.url?.absoluteString, "https://example.com/api/v1/activities/create/upload")
+            XCTAssertEqual(request.url?.absoluteString, "https://example.com/api/v1/activities/upload")
             XCTAssertEqual(request.httpMethod, "POST")
             XCTAssertEqual(request.value(forHTTPHeaderField: "X-API-Key"), "secret")
             XCTAssertNil(request.value(forHTTPHeaderField: "Authorization"))
