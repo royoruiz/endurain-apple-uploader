@@ -15,3 +15,4 @@ build/
 
 # Local development tools
 .serena/
+.atl/
