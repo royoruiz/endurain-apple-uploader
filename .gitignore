@@ -6,3 +6,12 @@ DerivedData/
 .env
 *.ipa
 build/
+
+# Xcode
+**/xcuserdata/
+
+# Build
+.build/
+
+# Local development tools
+.serena/
